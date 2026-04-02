@@ -181,10 +181,9 @@ class CombinedSOTALoss(nn.Module):
         # Store as list, convert to tensor on correct device during forward
         self._class_weights_list = class_weights
         
-        # Initialize losses without weights (weights applied in forward)
-        self.ce = nn.CrossEntropyLoss(reduction='none')  # Apply weight manually
-        self.dice = DiceLoss(class_weights=None)  # Will pass weights in forward
-        self.boundary = BoundaryAwareLoss()
+        self.ce = nn.CrossEntropyLoss(reduction='none')
+        self.dice = DiceLoss(class_weights=None)
+        self.boundary = BoundaryLoss()
         self.focal = FocalLoss() if focal_weight > 0 else None
 
     def set_epoch(self, epoch):

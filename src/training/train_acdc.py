@@ -22,8 +22,13 @@ from losses.sota_loss import CombinedSOTALoss, TTAInference
 CLASS_MAP = {0: 'BG', 1: 'RV', 2: 'MYO', 3: 'LV'}
 
 
-def evaluate_3d(model, dataset, device, num_classes=4):
-    """3D Volumetric evaluation."""
+def evaluate_3d(model, dataset, device, num_classes=4, volume_meta=None):
+    """3D Volumetric evaluation with spacing-aware HD95 (mm).
+    
+    Args:
+        volume_meta: dict mapping vol_idx -> {'effective_spacing': [sz, sy, sx]}
+                     from metadata.json. If None, HD95 is in raw voxels.
+    """
     model.eval()
     vol_preds = defaultdict(list)
     vol_targets = defaultdict(list)
@@ -47,9 +52,23 @@ def evaluate_3d(model, dataset, device, num_classes=4):
         pred_3d = np.stack([p[1] for p in sorted(vol_preds[vol_idx], key=lambda x: x[0])], axis=0)
         target_3d = np.stack([t[1] for t in sorted(vol_targets[vol_idx], key=lambda x: x[0])], axis=0)
         
+        spacing = None
+        if volume_meta is not None and vol_idx in volume_meta:
+            spacing = volume_meta[vol_idx].get('effective_spacing')
+        
         for c in range(1, num_classes):
             pred_c = (pred_3d == c)
             target_c = (target_3d == c)
+            
+            if not target_c.any():
+                if not pred_c.any():
+                    continue
+                dice_3d[c].append(0.0)
+                hd95_3d[c].append(100.0)
+                prec_3d[c].append(0.0)
+                recall_3d[c].append(0.0)
+                acc_3d[c].append(float((~pred_c).sum() / pred_c.size))
+                continue
             
             tp = (pred_c & target_c).sum()
             fp = (pred_c & ~target_c).sum()
@@ -69,22 +88,26 @@ def evaluate_3d(model, dataset, device, num_classes=4):
             if pred_c.any() and target_c.any():
                 pred_border = pred_c ^ binary_erosion(pred_c)
                 target_border = target_c ^ binary_erosion(target_c)
-                if pred_border.any() and target_border.any():
-                    d1 = distance_transform_edt(~target_c)[pred_border]
-                    d2 = distance_transform_edt(~pred_c)[target_border]
-                    hd95_3d[c].append(np.percentile(np.concatenate([d1, d2]), 95))
-                else:
-                    hd95_3d[c].append(0.0)
+                
+                if not pred_border.any():
+                    pred_border = pred_c
+                if not target_border.any():
+                    target_border = target_c
+                
+                d1 = distance_transform_edt(~target_c, sampling=spacing)[pred_border]
+                d2 = distance_transform_edt(~pred_c, sampling=spacing)[target_border]
+                hd95_3d[c].append(np.percentile(np.concatenate([d1, d2]), 95))
             else:
-                hd95_3d[c].append(0.0 if not pred_c.any() and not target_c.any() else 100.0)
+                hd95_3d[c].append(100.0)
     
+    def _safe_mean(lst):
+        return np.mean(lst) if len(lst) > 0 else 0.0
     
-    # Calculate means
-    mean_dice = np.mean([np.mean(dice_3d[c]) for c in range(1, num_classes)])
-    mean_hd95 = np.mean([np.mean(hd95_3d[c]) for c in range(1, num_classes)])
-    mean_prec = np.mean([np.mean(prec_3d[c]) for c in range(1, num_classes)])
-    mean_recall = np.mean([np.mean(recall_3d[c]) for c in range(1, num_classes)])
-    mean_acc = np.mean([np.mean(acc_3d[c]) for c in range(1, num_classes)])
+    mean_dice = np.mean([_safe_mean(dice_3d[c]) for c in range(1, num_classes)])
+    mean_hd95 = np.mean([_safe_mean(hd95_3d[c]) for c in range(1, num_classes)])
+    mean_prec = np.mean([_safe_mean(prec_3d[c]) for c in range(1, num_classes)])
+    mean_recall = np.mean([_safe_mean(recall_3d[c]) for c in range(1, num_classes)])
+    mean_acc = np.mean([_safe_mean(acc_3d[c]) for c in range(1, num_classes)])
     
     return {
         'mean_dice': mean_dice,
@@ -92,7 +115,6 @@ def evaluate_3d(model, dataset, device, num_classes=4):
         'mean_prec': mean_prec,
         'mean_recall': mean_recall,
         'mean_acc': mean_acc,
-        # Per-class raw lists for detailed logging
         'dice_all': dice_3d,
         'hd95_all': hd95_3d,
         'prec_all': prec_3d,
@@ -175,11 +197,11 @@ def main():
     parser.add_argument('--no_full_res', action='store_true', help='Disable full resolution mode')
     
     # Training
-    parser.add_argument('--epochs', type=int, default=150)
+    parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-5)
     parser.add_argument('--warmup_epochs', type=int, default=10)
-    parser.add_argument('--early_stop', type=int, default=30)
+    parser.add_argument('--early_stop', type=int, default=40)
     parser.add_argument('--use_amp', action='store_true', help='Mixed precision')
     parser.add_argument('--augment', action='store_true', help='Enable data augmentation')
     
@@ -251,8 +273,24 @@ def main():
     print(f"Eval:       {'3D' if eval_3d else '2D'} | TTA={'✓' if use_tta else '✗'}")
     print(f"Options:    AMP={'✓' if args.use_amp else '✗'}")
     
+    # Load volume metadata (spacing info for HD95 in mm)
+    metadata_path = os.path.join(args.data_dir, 'metadata.json')
+    volume_meta = {}
+    if os.path.exists(metadata_path):
+        with open(metadata_path) as f:
+            meta = json.load(f)
+        vol_info = meta.get('volume_info', {})
+        vol_names = sorted(vol_info.keys())
+        for idx, vname in enumerate(vol_names):
+            if 'effective_spacing' in vol_info[vname]:
+                volume_meta[idx] = vol_info[vname]
+        if volume_meta:
+            sample_sp = next(iter(volume_meta.values()))['effective_spacing']
+            print(f"HD95 Unit:  mm (spacing loaded, e.g. {[round(s,2) for s in sample_sp]})")
+        else:
+            print(f"HD95 Unit:  voxel (no spacing in metadata, re-run preprocess)")
+    
     # Data
-    # Create dataset - use augmented version for training if --augment is set
     base_dataset = ACDCDataset2D(args.data_dir, in_channels=in_channels)
     
     num_vols = len(base_dataset.vol_paths)
@@ -304,14 +342,14 @@ def main():
     )
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-7)
     scaler = torch.amp.GradScaler('cuda') if args.use_amp else None
     
     best_balanced = float('-inf')
     best_dice = 0.0
     best_hd95 = float('inf')
     epochs_no_improve = 0
-    ALPHA_HD95 = 0.1
+    ALPHA_HD95 = 0.7
     
     # History tracking for plotting
     history = {
@@ -330,7 +368,7 @@ def main():
     }
     
     print(f"\n{'='*60}")
-    print("Training Started (Target: Balanced Score = Dice - 0.1*HD95)")
+    print(f"Training Started (Target: Balanced Score = Dice - {ALPHA_HD95}*HD95)")
     print(f"{'='*60}\n")
     
     for epoch in range(args.epochs):
@@ -338,8 +376,7 @@ def main():
         loss = train_epoch(model, train_loader, criterion, optimizer, device, epoch, scaler, args.use_amp, args.deep_supervision)
         scheduler.step()
         
-        # Evaluate (3D volumetric by default)
-        metrics = evaluate_3d(model, val_ds, device, num_classes)
+        metrics = evaluate_3d(model, val_ds, device, num_classes, volume_meta=volume_meta)
         
         dice = metrics['mean_dice']
         hd95 = metrics['mean_hd95']

@@ -19,39 +19,31 @@ except ImportError:
 
 
 def get_train_augmentations():
-    """Get training augmentations for medical image segmentation."""
+    """Get training augmentations for medical image segmentation.
+    
+    Input is assumed to be Z-score normalized (mean~0, std~1) from preprocessing.
+    Only spatial and intensity augmentations are applied; no re-normalization
+    to avoid train/val distribution mismatch.
+    """
     if not HAS_ALBUMENTATIONS:
         return None
     
     return A.Compose([
-        # Spatial transforms
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.Rotate(limit=15, p=0.5, border_mode=0),
         A.Affine(scale=(0.85, 1.15), translate_percent=(-0.1, 0.1), p=0.5),
-        
-        # Elastic deformation (common in medical imaging)
         A.ElasticTransform(alpha=50, sigma=5, p=0.3),
         A.GridDistortion(num_steps=5, distort_limit=0.1, p=0.3),
-        
-        # Intensity transforms
-        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
-        A.GaussNoise(std_range=(0.02, 0.1), p=0.3),
+        A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.15, p=0.4),
+        A.GaussNoise(std_range=(0.01, 0.05), p=0.2),
         A.GaussianBlur(blur_limit=(3, 5), p=0.2),
-        
-        # Normalize and convert
-        A.Normalize(mean=0.0, std=1.0, max_pixel_value=1.0),
     ])
 
 
 def get_val_augmentations():
-    """Get validation augmentations (only normalization)."""
-    if not HAS_ALBUMENTATIONS:
-        return None
-    
-    return A.Compose([
-        A.Normalize(mean=0.0, std=1.0, max_pixel_value=1.0),
-    ])
+    """No-op for validation: data is already Z-score normalized."""
+    return None
 
 
 class ACDCDataset2D(Dataset):
@@ -192,24 +184,17 @@ class ACDCDataset2DAugmented(Dataset):
         img = vol[:, :, slice_idx].copy().astype(np.float32)
         gt = mask[:, :, slice_idx].copy().astype(np.int64)
         
-        # Apply augmentation
         if self.transform is not None:
-            # Normalize image to [0, 1] for augmentation
-            if img.max() > img.min():
-                img = (img - img.min()) / (img.max() - img.min())
-            
             transformed = self.transform(image=img, mask=gt)
             img = transformed['image']
             gt = transformed['mask']
             
-            # Convert to tensor format (C, H, W)
             img = torch.from_numpy(img).unsqueeze(0).float()
             gt = torch.from_numpy(gt).long()
         else:
             img = torch.from_numpy(img).unsqueeze(0)
             gt = torch.from_numpy(gt)
         
-        # Repeat channels if needed
         if self.in_channels == 3 and img.shape[0] == 1:
             img = img.repeat(3, 1, 1)
         
