@@ -96,8 +96,8 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate checkpoint with 3D metrics")
     parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--data_dir', type=str, default='preprocessed_data/ACDC/testing')
-    parser.add_argument('--model_type', type=str, default='hrnet_advanced',
-                       choices=['egmnet', 'hrnet_advanced'])
+    parser.add_argument('--model_type', type=str, default='specmamba',
+                       choices=['specmamba', 'hrnet_advanced', 'egmnet'])
     parser.add_argument('--base_channels', type=int, default=62)
     parser.add_argument('--use_pointrend', action='store_true')
     parser.add_argument('--full_resolution_mode', action='store_true')
@@ -112,9 +112,14 @@ def main():
     print(f"Data: {args.data_dir}")
     
     # Load model
-    if args.model_type == 'hrnet_advanced':
+    if args.model_type == 'specmamba':
+        from models.specmamba_net import SpecMambaNet
+        model = SpecMambaNet(
+            in_channels=3, num_classes=4,
+            base_channels=args.base_channels,
+        ).to(device)
+    elif args.model_type == 'hrnet_advanced':
         from training.test_advanced_arch import HRNetAdvanced
-        
         model = HRNetAdvanced(
             in_channels=3,
             base_channels=args.base_channels,

@@ -1,225 +1,144 @@
 """
-Architecture Validation Test Suite for SpectralVMUNet.
+Architecture Validation Test Suite for SpecMambaNet.
 
-Provides comprehensive testing for all model components without requiring
-a full dataset. Verifies tensor shapes, gradient flow, memory usage,
-and loss function computations.
-
-Test Categories:
-    - Module tests: SpectralGating, DirectionalScanner, VSSBlock
-    - Integration tests: Full network forward/backward passes
-    - Loss function tests: Dice, Frequency, SpectralDual, BoundaryAware
-    - Memory efficiency tests
+Verifies tensor shapes, gradient flow, deep supervision, and AMP compatibility.
 """
+
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
 
 import torch
 import torch.nn as nn
-from spectral_mamba import SpectralVMUNet
-from physics_loss import SpectralDualLoss, DiceLoss, FrequencyLoss, BoundaryAwareLoss
-from spectral_layers import SpectralGating
-from mamba_block import VSSBlock, DirectionalScanner
+
+from models.specmamba_net import (
+    SpectralBlock, PseudoMambaBlock, SpecMambaBlock, SpecMambaNet,
+)
 
 
-def test_spectral_gating():
-    """Test SpectralGating module."""
-    print("Testing SpectralGating...")
-    batch_size, channels, height, width = 2, 64, 64, 64
-    x = torch.randn(batch_size, channels, height, width)
-    
-    spec_gate = SpectralGating(channels, height, width)
-    output = spec_gate(x)
-    
-    assert output.shape == x.shape, f"Shape mismatch: {output.shape} vs {x.shape}"
-    print(f"✓ SpectralGating: {x.shape} -> {output.shape}")
+def test_spectral_block():
+    print("Testing SpectralBlock...")
+    block = SpectralBlock(64)
+    x = torch.randn(2, 64, 32, 32)
+    out = block(x)
+    assert out.shape == x.shape, f"Shape mismatch: {out.shape}"
+    print(f"  OK: {x.shape} -> {out.shape}")
 
 
-def test_directional_scanner():
-    """Test DirectionalScanner module."""
-    print("Testing DirectionalScanner...")
-    batch_size, channels, height, width = 2, 64, 32, 32
-    x = torch.randn(batch_size, channels, height, width)
-    
-    scanner = DirectionalScanner(channels, scan_dim=32)
-    output = scanner(x)
-    
-    assert output.shape == x.shape, f"Shape mismatch: {output.shape} vs {x.shape}"
-    print(f"✓ DirectionalScanner: {x.shape} -> {output.shape}")
+def test_pseudo_mamba_block():
+    print("Testing PseudoMambaBlock...")
+    block = PseudoMambaBlock(64)
+    x = torch.randn(2, 64, 32, 32)
+    out = block(x)
+    assert out.shape == x.shape, f"Shape mismatch: {out.shape}"
+    print(f"  OK: {x.shape} -> {out.shape}")
 
 
-def test_vss_block():
-    """Test VSSBlock module."""
-    print("Testing VSSBlock...")
-    batch_size, channels, height, width = 2, 64, 32, 32
-    x = torch.randn(batch_size, channels, height, width)
-    
-    vss = VSSBlock(channels, scan_dim=32)
-    output = vss(x)
-    
-    assert output.shape == x.shape, f"Shape mismatch: {output.shape} vs {x.shape}"
-    print(f"✓ VSSBlock: {x.shape} -> {output.shape}")
+def test_spec_mamba_block():
+    print("Testing SpecMambaBlock...")
+    block = SpecMambaBlock(48)
+    x = torch.randn(2, 48, 56, 56)
+    out = block(x)
+    assert out.shape == x.shape, f"Shape mismatch: {out.shape}"
+    print(f"  OK: {x.shape} -> {out.shape}")
 
 
-def test_spectral_vss_block():
-    """Test SpectralVSSBlock (dual-path)."""
-    print("Testing SpectralVSSBlock...")
-    from spectral_mamba import SpectralVSSBlock
-    
-    batch_size, channels, height, width = 2, 64, 64, 64
-    x = torch.randn(batch_size, channels, height, width)
-    
-    block = SpectralVSSBlock(channels, height, width, depth=1)
-    output = block(x)
-    
-    assert output.shape == x.shape, f"Shape mismatch: {output.shape} vs {x.shape}"
-    print(f"✓ SpectralVSSBlock: {x.shape} -> {output.shape}")
+def test_specmamba_net_forward():
+    print("Testing SpecMambaNet forward (eval)...")
+    model = SpecMambaNet(in_channels=3, num_classes=4, base_channels=32)
+    model.eval()
+    x = torch.randn(2, 3, 224, 224)
+    with torch.no_grad():
+        out = model(x)
+    assert out['output'].shape == (2, 4, 224, 224), f"Shape: {out['output'].shape}"
+    assert 'aux_outputs' not in out, "aux_outputs should not appear in eval mode"
+    print(f"  OK: output={out['output'].shape}")
 
 
-def test_full_network():
-    """Test complete SpectralVMUNet."""
-    print("\nTesting SpectralVMUNet...")
-    batch_size = 2
-    in_channels = 1
-    out_channels = 3
-    img_size = 256
-    
-    model = SpectralVMUNet(
-        in_channels=in_channels,
-        out_channels=out_channels,
-        img_size=img_size,
-        base_channels=64,
-        num_stages=4,
-        depth=2
-    )
-    
-    # Test forward pass
-    x = torch.randn(batch_size, in_channels, img_size, img_size)
-    output = model(x)
-    
-    assert output.shape == (batch_size, out_channels, img_size, img_size), \
-        f"Output shape mismatch: {output.shape}"
-    
-    # Count parameters
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"✓ SpectralVMUNet: {x.shape} -> {output.shape}")
-    print(f"  Total parameters: {total_params:,}")
-    print(f"  Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+def test_deep_supervision():
+    print("Testing deep supervision...")
+    model = SpecMambaNet(in_channels=3, num_classes=4, base_channels=32, deep_supervision=True)
+    model.train()
+    x = torch.randn(2, 3, 224, 224)
+    out = model(x)
+    assert 'aux_outputs' in out, "Missing aux_outputs in training mode"
+    assert len(out['aux_outputs']) == 3, f"Expected 3 aux heads, got {len(out['aux_outputs'])}"
+    for i, aux in enumerate(out['aux_outputs']):
+        assert aux.shape == out['output'].shape, f"Aux {i}: {aux.shape} != {out['output'].shape}"
+    print(f"  OK: {len(out['aux_outputs'])} aux heads, all match output shape")
 
 
-def test_losses():
-    """Test loss functions."""
-    print("\nTesting Loss Functions...")
-    batch_size, num_classes, height, width = 2, 3, 64, 64
-    
-    pred = torch.randn(batch_size, num_classes, height, width)
-    target = torch.randint(0, num_classes, (batch_size, height, width))
-    
-    # Test Dice Loss
-    dice_loss = DiceLoss()
-    dice = dice_loss(pred, target)
-    print(f"✓ Dice Loss: {dice.item():.4f}")
-    
-    # Test Frequency Loss
-    freq_loss = FrequencyLoss()
-    freq = freq_loss(pred, target)
-    print(f"✓ Frequency Loss: {freq.item():.4f}")
-    
-    # Test SpectralDualLoss
-    dual_loss = SpectralDualLoss(spatial_weight=1.0, freq_weight=0.1)
-    total, components = dual_loss(pred, target, return_components=True)
-    print(f"✓ SpectralDualLoss: {total.item():.4f}")
-    for name, value in components.items():
-        print(f"  - {name}: {value:.4f}")
-    
-    # Test BoundaryAwareLoss
-    boundary_loss = BoundaryAwareLoss()
-    boundary = boundary_loss(pred, target)
-    print(f"✓ BoundaryAwareLoss: {boundary.item():.4f}")
-
-
-def test_backward_pass():
-    """Test that gradients flow correctly."""
-    print("\nTesting Backward Pass...")
-    batch_size = 2
-    in_channels = 1
-    out_channels = 3
-    img_size = 256
-    
-    model = SpectralVMUNet(
-        in_channels=in_channels,
-        out_channels=out_channels,
-        img_size=img_size,
-        base_channels=64,
-        num_stages=4,
-        depth=2
-    )
-    
-    loss_fn = SpectralDualLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    
-    # Forward-backward pass
-    x = torch.randn(batch_size, in_channels, img_size, img_size)
-    target = torch.randint(0, out_channels, (batch_size, img_size, img_size))
-    
-    output = model(x)
-    loss = loss_fn(output, target)
+def test_gradient_flow():
+    print("Testing gradient flow...")
+    model = SpecMambaNet(in_channels=3, num_classes=4, base_channels=16)
+    model.train()
+    x = torch.randn(1, 3, 64, 64)
+    out = model(x)
+    loss = out['output'].sum()
     loss.backward()
-    
-    # Check that gradients exist
-    has_gradients = False
-    for param in model.parameters():
-        if param.grad is not None and param.grad.abs().sum() > 0:
-            has_gradients = True
-            break
-    
-    assert has_gradients, "No gradients found!"
-    print(f"✓ Backward Pass: Loss = {loss.item():.4f}")
-    print(f"  Gradients flowing correctly")
+    has_grad = all(p.grad is not None for p in model.parameters() if p.requires_grad)
+    assert has_grad, "Some parameters have no gradient"
+    print(f"  OK: all parameters received gradients")
 
 
-def test_memory_efficiency():
-    """Test memory usage."""
-    print("\nTesting Memory Efficiency...")
-    import gc
-    
-    model = SpectralVMUNet(
-        in_channels=1,
-        out_channels=3,
-        img_size=256,
-        base_channels=64,
-        num_stages=4,
-        depth=2
-    )
-    
-    # Get model size
-    param_size = sum(p.numel() * 4 for p in model.parameters()) / 1024 / 1024  # MB
-    print(f"✓ Model Size: {param_size:.2f} MB")
-    
-    # Test forward pass memory
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    
-    x = torch.randn(1, 1, 256, 256)
-    try:
-        output = model(x)
-        print(f"✓ Forward Pass: Memory usage acceptable")
-    except RuntimeError as e:
-        print(f"✗ Forward Pass: {e}")
+def test_different_sizes():
+    print("Testing different input sizes...")
+    model = SpecMambaNet(in_channels=3, num_classes=2, base_channels=16)
+    model.eval()
+    for size in [64, 128, 224, 256]:
+        x = torch.randn(1, 3, size, size)
+        with torch.no_grad():
+            out = model(x)
+        assert out['output'].shape == (1, 2, size, size), f"Size {size}: {out['output'].shape}"
+        print(f"  OK: {size}x{size}")
 
 
-if __name__ == "__main__":
-    print("=" * 60)
-    print("Spectral Mamba (Spec-VMamba) - Architecture Validation")
-    print("=" * 60)
-    
-    # Run tests
-    test_spectral_gating()
-    test_directional_scanner()
-    test_vss_block()
-    test_spectral_vss_block()
-    test_full_network()
-    test_losses()
-    test_backward_pass()
-    test_memory_efficiency()
-    
-    print("\n" + "=" * 60)
-    print("✓ All tests passed!")
-    print("=" * 60)
+def test_multi_channel_input():
+    print("Testing 4-channel input (BraTS-style)...")
+    model = SpecMambaNet(in_channels=4, num_classes=4, base_channels=16)
+    model.eval()
+    x = torch.randn(1, 4, 128, 128)
+    with torch.no_grad():
+        out = model(x)
+    assert out['output'].shape == (1, 4, 128, 128)
+    print(f"  OK: {out['output'].shape}")
+
+
+def test_param_count():
+    print("Testing parameter count...")
+    model = SpecMambaNet(in_channels=3, num_classes=4, base_channels=48)
+    params = sum(p.numel() for p in model.parameters())
+    print(f"  C=48: {params:,} params")
+    assert params > 0, "Model has no parameters"
+    print(f"  OK")
+
+
+if __name__ == '__main__':
+    tests = [
+        test_spectral_block,
+        test_pseudo_mamba_block,
+        test_spec_mamba_block,
+        test_specmamba_net_forward,
+        test_deep_supervision,
+        test_gradient_flow,
+        test_different_sizes,
+        test_multi_channel_input,
+        test_param_count,
+    ]
+
+    print(f"\n{'='*60}")
+    print("SpecMambaNet Test Suite")
+    print(f"{'='*60}\n")
+
+    passed = 0
+    for test_fn in tests:
+        try:
+            test_fn()
+            passed += 1
+        except Exception as e:
+            print(f"  FAILED: {e}")
+        print()
+
+    print(f"{'='*60}")
+    print(f"Results: {passed}/{len(tests)} tests passed")
+    print(f"{'='*60}")

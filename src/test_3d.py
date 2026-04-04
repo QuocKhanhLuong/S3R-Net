@@ -147,8 +147,8 @@ def main():
                         help='Path to test data directory')
     
     # Model selection
-    parser.add_argument('--model', type=str, default='hrnet_dcn',
-                        choices=['hrnet_dcn', 'hrnet_resnet34'],
+    parser.add_argument('--model', type=str, default='specmamba',
+                        choices=['specmamba', 'hrnet_dcn', 'hrnet_resnet34'],
                         help='Model architecture')
     parser.add_argument('--base_channels', type=int, default=48, help='Base channels (32/48/64)')
     parser.add_argument('--use_pointrend', action='store_true', help='Enable PointRend (hrnet_dcn only)')
@@ -177,7 +177,16 @@ def main():
     num_classes = 4
     in_channels = 3
     
-    if args.model == 'hrnet_dcn':
+    if args.model == 'specmamba':
+        from models.specmamba_net import SpecMambaNet
+        model = SpecMambaNet(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            base_channels=args.base_channels,
+            deep_supervision=args.deep_supervision,
+        ).to(device)
+        model_name = "SpecMambaNet"
+    elif args.model == 'hrnet_dcn':
         from models.hrnet_dcn import HRNetDCN
         model = HRNetDCN(
             in_channels=in_channels,

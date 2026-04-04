@@ -17,7 +17,6 @@ from collections import defaultdict
 from scipy.ndimage import distance_transform_edt, binary_erosion
 from datetime import datetime
 
-from models.hrnet_dcn import HRNetDCN
 from data.synapse_dataset import SynapseDataset2D
 from losses.sota_loss import CombinedSOTALoss
 
@@ -96,6 +95,8 @@ def main():
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--epochs', type=int, default=150)
     parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--model', type=str, default='specmamba',
+                        choices=['specmamba', 'hrnet_dcn'])
     parser.add_argument('--base_channels', type=int, default=48)
     parser.add_argument('--use_pointrend', action='store_true')
     parser.add_argument('--use_amp', action='store_true')
@@ -107,17 +108,24 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     
     if args.exp_name is None:
-        args.exp_name = f"synapse_hrnet_dcn_{datetime.now().strftime('%Y%m%d_%H%M')}"
+        args.exp_name = f"synapse_{args.model}_{datetime.now().strftime('%Y%m%d_%H%M')}"
     
     print(f"\n{'='*60}")
-    print("Synapse Training - HRNet DCN (14 classes)")
+    print(f"Synapse Training - {args.model} (14 classes)")
     print(f"{'='*60}")
     
     # Model - 14 output classes
-    model = HRNetDCN(
-        in_channels=3, num_classes=14, base_channels=args.base_channels,
-        use_pointrend=args.use_pointrend
-    ).to(device)
+    if args.model == 'specmamba':
+        from models.specmamba_net import SpecMambaNet
+        model = SpecMambaNet(
+            in_channels=3, num_classes=14, base_channels=args.base_channels,
+        ).to(device)
+    else:
+        from models.hrnet_dcn import HRNetDCN
+        model = HRNetDCN(
+            in_channels=3, num_classes=14, base_channels=args.base_channels,
+            use_pointrend=args.use_pointrend
+        ).to(device)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     # Data

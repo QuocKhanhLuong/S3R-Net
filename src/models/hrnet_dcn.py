@@ -1,6 +1,8 @@
 """
-HRNet with Asymmetric DCN (Dilation Pyramid)
-Production-ready model file
+[DEPRECATED] HRNet with Asymmetric DCN (Dilation Pyramid)
+
+This module is deprecated in favour of SpecMambaNet (see specmamba_net.py).
+Kept for backward-compatible checkpoint loading only.
 
 Features:
 - Asymmetric depth per stage (2,4,6 blocks)
@@ -8,6 +10,12 @@ Features:
 - Optional PointRend for boundary refinement
 - Full resolution mode (no downsampling in stem)
 """
+import warnings as _w
+_w.warn(
+    "hrnet_dcn is deprecated — use models.specmamba_net.SpecMambaNet instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 import torch
 import torch.nn as nn

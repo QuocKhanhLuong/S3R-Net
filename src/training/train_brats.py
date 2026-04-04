@@ -18,7 +18,6 @@ from collections import defaultdict
 from scipy.ndimage import distance_transform_edt, binary_erosion
 from datetime import datetime
 
-from models.hrnet_dcn import HRNetDCN
 from data.brats_dataset import BraTSDataset2D
 from losses.sota_loss import CombinedSOTALoss
 
@@ -88,7 +87,9 @@ def main():
     parser.add_argument('--batch_size', type=int, default=4)  # Smaller due to 4 channels
     parser.add_argument('--epochs', type=int, default=150)
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--base_channels', type=int, default=32)  # Smaller for memory
+    parser.add_argument('--model', type=str, default='specmamba',
+                        choices=['specmamba', 'hrnet_dcn'])
+    parser.add_argument('--base_channels', type=int, default=32)
     parser.add_argument('--use_pointrend', action='store_true')
     parser.add_argument('--use_amp', action='store_true')
     parser.add_argument('--save_dir', type=str, default='weights')
@@ -99,17 +100,24 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     
     if args.exp_name is None:
-        args.exp_name = f"brats_hrnet_dcn_{datetime.now().strftime('%Y%m%d_%H%M')}"
+        args.exp_name = f"brats_{args.model}_{datetime.now().strftime('%Y%m%d_%H%M')}"
     
     print(f"\n{'='*60}")
-    print("BraTS21 Training - HRNet DCN")
+    print(f"BraTS21 Training - {args.model}")
     print(f"{'='*60}")
     
     # Model - 4 input channels for 4 modalities
-    model = HRNetDCN(
-        in_channels=4, num_classes=4, base_channels=args.base_channels,
-        use_pointrend=args.use_pointrend
-    ).to(device)
+    if args.model == 'specmamba':
+        from models.specmamba_net import SpecMambaNet
+        model = SpecMambaNet(
+            in_channels=4, num_classes=4, base_channels=args.base_channels,
+        ).to(device)
+    else:
+        from models.hrnet_dcn import HRNetDCN
+        model = HRNetDCN(
+            in_channels=4, num_classes=4, base_channels=args.base_channels,
+            use_pointrend=args.use_pointrend
+        ).to(device)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     # Data - use all 4 modalities

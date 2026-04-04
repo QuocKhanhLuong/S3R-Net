@@ -1,6 +1,9 @@
 """
-PointRend Module for Fine-grained Boundary Refinement
+[DEPRECATED] PointRend Module for Fine-grained Boundary Refinement
 Reference: https://arxiv.org/abs/1912.08193
+
+This module is deprecated. SpecMambaNet does not use PointRend.
+Kept for backward-compatible checkpoint loading only.
 """
 
 import torch

@@ -188,9 +188,9 @@ def main():
     parser.add_argument('--num_workers', type=int, default=4)
     
     # Model Selection
-    parser.add_argument('--model', type=str, default='hrnet_dcn', 
-                        choices=['hrnet_dcn', 'hrnet_resnet34'],
-                        help='Model architecture: hrnet_dcn (default) or hrnet_resnet34')
+    parser.add_argument('--model', type=str, default='specmamba', 
+                        choices=['specmamba', 'hrnet_dcn', 'hrnet_resnet34'],
+                        help='Model architecture: specmamba (default), hrnet_dcn, or hrnet_resnet34')
     parser.add_argument('--base_channels', type=int, default=48, help='Base channels (32/48/64)')
     parser.add_argument('--use_pointrend', action='store_true', help='Enable PointRend (hrnet_dcn only)')
     parser.add_argument('--use_shearlet', action='store_true', help='Enable Shearlet head (hrnet_dcn only)')
@@ -229,13 +229,23 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
     
     if args.exp_name is None:
-        args.exp_name = f"acdc_hrnet_c{args.base_channels}_{datetime.now().strftime('%m%d_%H%M')}"
+        args.exp_name = f"acdc_{args.model}_c{args.base_channels}_{datetime.now().strftime('%m%d_%H%M')}"
     
     # Model
     num_classes = 4
     in_channels = 3
     
-    if args.model == 'hrnet_dcn':
+    if args.model == 'specmamba':
+        from models.specmamba_net import SpecMambaNet
+        model = SpecMambaNet(
+            in_channels=in_channels,
+            num_classes=num_classes,
+            base_channels=args.base_channels,
+            img_size=224,
+            deep_supervision=args.deep_supervision,
+        ).to(device)
+        model_name = f"SpecMambaNet-C{args.base_channels}"
+    elif args.model == 'hrnet_dcn':
         from models.hrnet_dcn import HRNetDCN
         model = HRNetDCN(
             in_channels=in_channels,

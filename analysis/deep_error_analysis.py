@@ -25,7 +25,6 @@ from torch.utils.data import DataLoader
 import argparse
 
 from data.acdc_dataset import ACDCDataset2D
-from training.test_advanced_arch import HRNetAdvanced
 
 CLASS_NAMES = {1: "RV", 2: "MYO", 3: "LV"}
 
@@ -205,48 +204,49 @@ def analyze(args):
     # Load Model
     print(f">>> Loading model from: {args.checkpoint}")
     
-    # Infer config from checkpoint
-    use_pointrend = 'pointrend' in args.checkpoint.lower()
-    
-    # Try to detect block counts from checkpoint keys
-    stage2_depth = args.stage2_blocks
-    stage3_depth = args.stage3_blocks  
-    stage4_depth = args.stage4_blocks
+    model_type = getattr(args, 'model', 'specmamba')
     
     if os.path.exists(args.checkpoint):
         checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
-        
-        # Auto-detect block counts from checkpoint keys
-        max_s2, max_s3, max_s4 = 0, 0, 0
-        for key in checkpoint.keys():
-            if key.startswith('stage2.branches.0.'):
-                idx = int(key.split('.')[2]) + 1 if key.split('.')[2].isdigit() else 0
-                max_s2 = max(max_s2, int(key.split('.')[3]) + 1) if key.split('.')[3].isdigit() else max_s2
-            elif key.startswith('stage3.branches.0.'):
-                max_s3 = max(max_s3, int(key.split('.')[3]) + 1) if key.split('.')[3].isdigit() else max_s3
-            elif key.startswith('stage4.branches.0.'):
-                max_s4 = max(max_s4, int(key.split('.')[3]) + 1) if key.split('.')[3].isdigit() else max_s4
-        
-        if max_s2 > 0: stage2_depth = max_s2
-        if max_s3 > 0: stage3_depth = max_s3
-        if max_s4 > 0: stage4_depth = max_s4
-        
-        print(f">>> Detected config: stage2={stage2_depth}, stage3={stage3_depth}, stage4={stage4_depth}")
     else:
         checkpoint = None
         print(f">>> WARNING: Checkpoint not found, using random weights!")
     
-    model = HRNetAdvanced(
-        in_channels=3,
-        base_channels=64,
-        num_classes=4,
-        stage_configs=[
-            {'blocks': ['dcn'] * stage2_depth},
-            {'blocks': ['dcn'] * stage3_depth},
-            {'blocks': ['dcn'] * stage4_depth}
-        ],
-        use_pointrend=use_pointrend
-    ).to(device)
+    if model_type == 'specmamba' or (checkpoint and 'enc1.spectral.conv_real.weight' in checkpoint):
+        from models.specmamba_net import SpecMambaNet
+        base_ch = getattr(args, 'base_channels', 48)
+        model = SpecMambaNet(
+            in_channels=3, num_classes=4, base_channels=base_ch,
+        ).to(device)
+        print(f">>> Using SpecMambaNet (base_channels={base_ch})")
+    else:
+        from training.test_advanced_arch import HRNetAdvanced
+        use_pointrend = 'pointrend' in args.checkpoint.lower()
+        stage2_depth = args.stage2_blocks
+        stage3_depth = args.stage3_blocks
+        stage4_depth = args.stage4_blocks
+        if checkpoint:
+            max_s2, max_s3, max_s4 = 0, 0, 0
+            for key in checkpoint.keys():
+                if key.startswith('stage2.branches.0.'):
+                    max_s2 = max(max_s2, int(key.split('.')[3]) + 1) if key.split('.')[3].isdigit() else max_s2
+                elif key.startswith('stage3.branches.0.'):
+                    max_s3 = max(max_s3, int(key.split('.')[3]) + 1) if key.split('.')[3].isdigit() else max_s3
+                elif key.startswith('stage4.branches.0.'):
+                    max_s4 = max(max_s4, int(key.split('.')[3]) + 1) if key.split('.')[3].isdigit() else max_s4
+            if max_s2 > 0: stage2_depth = max_s2
+            if max_s3 > 0: stage3_depth = max_s3
+            if max_s4 > 0: stage4_depth = max_s4
+        print(f">>> Detected config: stage2={stage2_depth}, stage3={stage3_depth}, stage4={stage4_depth}")
+        model = HRNetAdvanced(
+            in_channels=3, base_channels=64, num_classes=4,
+            stage_configs=[
+                {'blocks': ['dcn'] * stage2_depth},
+                {'blocks': ['dcn'] * stage3_depth},
+                {'blocks': ['dcn'] * stage4_depth}
+            ],
+            use_pointrend=use_pointrend
+        ).to(device)
     
     if checkpoint:
         model.load_state_dict(checkpoint, strict=False)

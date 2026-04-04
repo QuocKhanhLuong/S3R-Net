@@ -16,7 +16,6 @@ import argparse
 from tqdm import tqdm
 from datetime import datetime
 
-from models.egm_net import EGMNet
 from data.acdc_dataset import ACDCDataset2D
 
 
@@ -288,9 +287,9 @@ def main():
     parser.add_argument('--checkpoint', type=str, required=True, help='Path to model checkpoint')
     
     # Model type
-    parser.add_argument('--model_type', type=str, default='egmnet', 
-                       choices=['egmnet', 'hrnet_advanced'],
-                       help='Model type: egmnet or hrnet_advanced (from test_advanced_arch)')
+    parser.add_argument('--model_type', type=str, default='specmamba', 
+                       choices=['specmamba', 'egmnet', 'hrnet_advanced'],
+                       help='Model type: specmamba (default), egmnet, or hrnet_advanced')
     parser.add_argument('--block_type', type=str, default='dcn')
     parser.add_argument('--use_dog', action='store_true')
     parser.add_argument('--fine_head_type', type=str, default='shearlet')
@@ -317,10 +316,14 @@ def main():
     print(f"Mode: {args.mode}")
     
     # Load model
-    if args.model_type == 'hrnet_advanced':
-        # Import HRNetAdvanced from test_advanced_arch
+    if args.model_type == 'specmamba':
+        from models.specmamba_net import SpecMambaNet
+        model = SpecMambaNet(
+            in_channels=3, num_classes=4,
+            base_channels=args.base_channels,
+        ).to(device)
+    elif args.model_type == 'hrnet_advanced':
         from training.test_advanced_arch import HRNetAdvanced
-        
         model = HRNetAdvanced(
             in_channels=3,
             base_channels=args.base_channels,
@@ -335,6 +338,7 @@ def main():
             full_resolution_mode=args.full_resolution_mode
         ).to(device)
     else:
+        from models.egm_net import EGMNet
         model = EGMNet(
             in_channels=3,
             num_classes=4,
