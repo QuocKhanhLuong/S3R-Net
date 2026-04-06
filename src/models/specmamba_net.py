@@ -44,20 +44,58 @@ class PriorKnowledgeConstructor(nn.Module):
 # BUILDING BLOCKS
 # =============================================================================
 
-class DWConvBlock(nn.Module):
-    """Inverted Bottleneck DWConv — local edge refinement at full-res.
-    Expand → DWConv3×3 → Shrink (MobileNetV2-style).
+class DCNv3Block(nn.Module):
+    """DCNv3-style Deformable Conv — adaptive edge refinement at full-res.
+    
+    Inverted Bottleneck: Expand → DCNv3 (grouped deformable conv + modulation) → Shrink.
+    Supports HDC dilation for multi-scale receptive fields.
+    Paper: "InternImage: Exploring Large-Scale Vision Foundation Models with DCNv3"
     """
-    def __init__(self, dim, expansion=4):
+    def __init__(self, dim, expansion=4, kernel_size=3, num_groups=4, dilation=1):
         super().__init__()
+        from torchvision.ops import deform_conv2d
+        self.deform_conv2d = deform_conv2d
+        
         mid = dim * expansion
+        self.num_groups = num_groups
+        self.kernel_size = kernel_size
+        self.dilation = dilation
+        pad = dilation * (kernel_size // 2)  # same padding with dilation
+        
+        # Inverted bottleneck: expand → deform → shrink
         self.pw_expand = nn.Conv2d(dim, mid, 1, bias=False)
-        self.dw = nn.Conv2d(mid, mid, 3, padding=1, groups=mid, bias=False)
+        
+        # DCNv3: offset (2*K*K per group) + mask (K*K per group)
+        # offset_mask conv also uses same dilation for consistent RF
+        kk = kernel_size * kernel_size
+        om_pad = dilation * (kernel_size // 2)
+        self.offset_mask = nn.Conv2d(mid, num_groups * 3 * kk, kernel_size,
+                                     padding=om_pad, dilation=dilation, bias=True)
+        nn.init.zeros_(self.offset_mask.weight)
+        nn.init.zeros_(self.offset_mask.bias)
+        
+        # Grouped deformable conv weight
+        self.dcn_weight = nn.Parameter(torch.randn(mid, mid // num_groups, kernel_size, kernel_size) * 0.02)
+        self.dcn_pad = pad
+        
         self.pw_shrink = nn.Conv2d(mid, dim, 1, bias=False)
         self.norm = nn.GroupNorm(min(8, dim), dim)
         self.act = nn.GELU()
+    
     def forward(self, x):
-        return self.act(self.norm(self.pw_shrink(self.act(self.dw(self.act(self.pw_expand(x)))))))
+        h = self.act(self.pw_expand(x))
+        
+        # Predict offsets + modulation masks
+        kk = self.kernel_size * self.kernel_size
+        om = self.offset_mask(h)
+        offset = om[:, :self.num_groups * 2 * kk]
+        mask = torch.sigmoid(om[:, self.num_groups * 2 * kk:])
+        
+        # Deformable conv with dilation
+        h = self.deform_conv2d(h, offset, self.dcn_weight,
+                               padding=self.dcn_pad, dilation=self.dilation, mask=mask)
+        
+        return self.act(self.norm(self.pw_shrink(self.act(h))))
 
 
 class AdaptiveFourierMixer(nn.Module):
@@ -88,9 +126,15 @@ class AdaptiveFourierMixer(nn.Module):
 
 
 class CrossScanGatedMixer(nn.Module):
-    """4-way cross-scan (H↕ + W↔ × bidirectional) + gating."""
-    def __init__(self, dim, kernel_size=3):
+    """Cross-scan with configurable scan passes + gating.
+    
+    num_passes=1: forward-only (H scan)
+    num_passes=2: bidirectional (H↕)
+    num_passes=4: full cross-scan (H↕ + W↔, bidirectional)
+    """
+    def __init__(self, dim, kernel_size=3, num_passes=4):
         super().__init__()
+        self.num_passes = num_passes
         self.linear_in = nn.Linear(dim, dim, bias=False)
         self.linear_gate = nn.Linear(dim, dim, bias=False)
         self.dw_conv = nn.Conv1d(dim, dim, kernel_size, padding=kernel_size-1,
@@ -99,7 +143,14 @@ class CrossScanGatedMixer(nn.Module):
         self.norm = nn.GroupNorm(min(8, dim), dim)
         self.act = nn.GELU()
 
-    def _bidi(self, seq):
+    def _scan_fwd(self, seq):
+        """Single direction scan."""
+        L = seq.shape[1]
+        h = self.act(self.linear_in(seq)).transpose(1, 2)
+        return self.dw_conv(h)[..., :L].transpose(1, 2)
+
+    def _scan_bidi(self, seq):
+        """Bidirectional scan."""
         L = seq.shape[1]
         h = self.act(self.linear_in(seq)).transpose(1, 2)
         return ((self.dw_conv(h)[..., :L] +
@@ -107,9 +158,21 @@ class CrossScanGatedMixer(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        hh = self._bidi(x.permute(0,3,2,1).reshape(B*W,H,C)).reshape(B,W,H,C).permute(0,3,2,1)
-        hw = self._bidi(x.permute(0,2,3,1).reshape(B*H,W,C)).reshape(B,H,W,C).permute(0,3,1,2)
-        h = (hh + hw) * 0.5
+        
+        if self.num_passes >= 4:
+            # Full cross-scan: H↕ + W↔ bidirectional
+            hh = self._scan_bidi(x.permute(0,3,2,1).reshape(B*W,H,C)).reshape(B,W,H,C).permute(0,3,2,1)
+            hw = self._scan_bidi(x.permute(0,2,3,1).reshape(B*H,W,C)).reshape(B,H,W,C).permute(0,3,1,2)
+            h = (hh + hw) * 0.5
+        elif self.num_passes >= 2:
+            # Bidirectional H-scan only
+            hh = self._scan_bidi(x.permute(0,3,2,1).reshape(B*W,H,C)).reshape(B,W,H,C).permute(0,3,2,1)
+            h = hh
+        else:
+            # Forward H-scan only
+            hh = self._scan_fwd(x.permute(0,3,2,1).reshape(B*W,H,C)).reshape(B,W,H,C).permute(0,3,2,1)
+            h = hh
+        
         g = torch.sigmoid(self.linear_gate(x.permute(0,2,3,1))).permute(0,3,1,2)
         return self.act(self.norm(self.linear_out((h*g).permute(0,2,3,1)).permute(0,3,1,2)))
 
@@ -258,7 +321,7 @@ class TriStreamFusion(nn.Module):
 class SpecMambaNet(nn.Module):
     """3-Stream Frequency-Guided HRNet.
 
-    FR (224², C):   DWConvBlock — local edge refinement
+    FR (224², C):   DCNv3Block — adaptive edge refinement (deformable conv)
     HR (112², C):   AdaptiveFourierMixer — global spectral mixing
     LR (56², 2C):   CrossScanGatedMixer — sequential context
     TriFuseLayer per stage, TriStreamFusion at end.
@@ -271,6 +334,25 @@ class SpecMambaNet(nn.Module):
         self.deep_supervision = deep_supervision
         self.num_stages = num_stages
         C = base_channels
+
+        # Asymmetric depth: [2, 4, 6] blocks per stage
+        stage_depths = [blocks_per_stage * (i + 1) for i in range(num_stages)]
+        
+        # HDC dilation pyramid per FR stage
+        # Stage 1: [1, 2],  Stage 2: [1, 2, 4, 8],  Stage 3: [1, 2, 4, 8, 16, 32]
+        hdc_dilations = []
+        for d in stage_depths:
+            dils = [2**i for i in range(d)]  # [1, 2, 4, 8, ...]
+            hdc_dilations.append(dils)
+        
+        # Mode pyramid per HR stage
+        # Stage 1: modes=H/8, Stage 2: modes=H/4, Stage 3: modes=H/2
+        hr_size = img_size // 2  # 112
+        mode_pyramid = [max(4, hr_size // (2 ** (num_stages - i))) for i in range(num_stages)]
+        
+        # Scan depth pyramid per LR stage
+        # Stage 1: 1-pass, Stage 2: 2-pass, Stage 3: 4-pass
+        scan_pyramid = [min(4, 2 ** i) for i in range(num_stages)]
 
         self.prior = PriorKnowledgeConstructor()
 
@@ -293,21 +375,33 @@ class SpecMambaNet(nn.Module):
             nn.GroupNorm(min(8, C*2), C*2), nn.GELU(),
         )
 
-        # Per-stage blocks + TriFuseLayer
+        # Per-stage blocks + TriFuseLayer (asymmetric depth)
         self.fr_stages = nn.ModuleList()
         self.hr_stages = nn.ModuleList()
         self.lr_stages = nn.ModuleList()
         self.tri_fuse = nn.ModuleList()
 
-        for _ in range(num_stages):
+        for s in range(num_stages):
+            depth = stage_depths[s]
+            dils = hdc_dilations[s]
+            modes = mode_pyramid[s]
+            passes = scan_pyramid[s]
+            
+            # FR: DCNv3 with HDC dilation pyramid
             self.fr_stages.append(nn.Sequential(*[
-                ResidualBlock(DWConvBlock(C), C) for _ in range(blocks_per_stage)]))
+                ResidualBlock(DCNv3Block(C, dilation=dils[i]), C)
+                for i in range(depth)]))
+            
+            # HR: SpectralBlock with mode pyramid
             self.hr_stages.append(nn.Sequential(*[
-                ResidualBlock(AdaptiveFourierMixer(C, num_modes), C)
-                for _ in range(blocks_per_stage)]))
+                ResidualBlock(AdaptiveFourierMixer(C, modes), C)
+                for _ in range(depth)]))
+            
+            # LR: MambaBlock with scan depth pyramid
             self.lr_stages.append(nn.Sequential(*[
-                ResidualBlock(CrossScanGatedMixer(C*2), C*2)
-                for _ in range(blocks_per_stage)]))
+                ResidualBlock(CrossScanGatedMixer(C*2, num_passes=passes), C*2)
+                for _ in range(depth)]))
+            
             self.tri_fuse.append(TriFuseLayer(C, C, C*2))
 
         # Asymmetric Skip Attention (stream-specific denoising)

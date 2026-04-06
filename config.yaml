@@ -21,18 +21,32 @@ model:
   # SpecMamba (3-Stream Asymmetric Spec-HRNet)
   specmamba:
     base_channels: 48            # 32=small, 48=base, 64=large
-    num_modes: 32                # FFT mode count for AdaptiveFourierMixer
-    blocks_per_stage: 2          # Blocks per stream per stage
+    num_modes: 32                # FFT mode count (base, overridden by mode pyramid)
+    blocks_per_stage: 2          # Base depth (asymmetric: stage_i = base × (i+1))
     num_stages: 3                # Number of parallel processing stages
     deep_supervision: true       # Aux heads from fused HR after stage 1,2
     
+    # Asymmetric Depth: [2, 4, 6] blocks per stage (total 36 blocks)
+    # HDC Dilation Pyramid (FR only):
+    #   Stage 1: d=[1, 2]
+    #   Stage 2: d=[1, 2, 4, 8]
+    #   Stage 3: d=[1, 2, 4, 8, 16, 32]
+    # Mode Pyramid (HR only):
+    #   Stage 1: modes=14 (H/8)  — low/mid frequency
+    #   Stage 2: modes=28 (H/4)  — mid frequency
+    #   Stage 3: modes=56 (H/2)  — high frequency
+    # Scan Depth Pyramid (LR only):
+    #   Stage 1: 1-pass (forward only)
+    #   Stage 2: 2-pass (bidirectional)
+    #   Stage 3: 4-pass (full cross-scan H↕+W↔)
+
     # Architecture Summary (C=48):
-    # FR Stream (224², DWConv):     122K params — local edge refinement
-    # HR Stream (112², FFT):        605K params — global spectral mixing
-    # LR Stream (56², CrossScan):   170K params — sequential context
-    # TriFuse (5-path cross-fuse):  396K params — all-to-all minus LR→FR
-    # AsymSkipAttn (3 types):        25K params — stream-specific denoising
-    # Total:                       ~1.42M params
+    # FR Stream (224², DCNv3+HDC): 3,460K params — adaptive deformable edge refinement
+    # HR Stream (112², FFT+Modes): 2,175K params — progressive spectral mixing
+    # LR Stream (56², CrossScan):    340K params — progressive sequential context
+    # TriFuse (5-path cross-fuse):   396K params — all-to-all minus LR→FR
+    # AsymSkipAttn (3 types):         25K params — stream-specific denoising
+    # Total:                        ~6.50M params
     
     # Prior Knowledge Input: Raw + Sobel Edge + Local Variance (3 channels)
     # Asymmetric Skip Attention:
@@ -113,37 +127,39 @@ data:
 # =============================================================================
 training:
   # Basic
-  epochs: 200
+  epochs: 250
   batch_size: 8                  # Reduce for BraTS (4 channels)
   num_workers: 4
   
   # Optimizer
   optimizer: "adamw"
-  learning_rate: 1e-4
+  learning_rate: 3e-4            # 3-stream needs stronger initial gradient
   weight_decay: 1e-5
   
   # Scheduler
   scheduler: "cosine"
   scheduler_params:
-    T_max: 200
+    T_max: 250
     eta_min: 1e-7
     
   # Training Techniques
   grad_clip: 1.0
   use_amp: true                  # Mixed precision (recommended)
-  early_stop: 30
+  early_stop: 50                 # 3-stream converges slower
   
   # Warmup
-  warmup_epochs: 10
+  warmup_epochs: 20              # Longer warmup for 3-stream stability
 
 # =============================================================================
 # LOSS CONFIGURATION
 # =============================================================================
 loss:
-  ce_weight: 1.0
+  ce_weight: 0.5                 # Reduced — Focal handles hard examples
+  focal_weight: 0.5              # Focal gamma=2.0 for RV false positives
   dice_weight: 1.0
-  boundary_weight: 0.5
-  warmup_epochs: 10              # Boundary loss warmup
+  boundary_weight: 1.5           # Boosted for HD95 reduction (was 0.5)
+  warmup_epochs: 20              # Boundary starts at epoch 20, ramps to 40
+  class_weights: [0.1, 2.5, 1.5, 1.0]  # BG, RV(↑), MYO, LV
 
 # =============================================================================
 # EVALUATION CONFIGURATION

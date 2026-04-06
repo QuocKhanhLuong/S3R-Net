@@ -3,8 +3,9 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
 import torch
 from models.specmamba_net import (
-    PriorKnowledgeConstructor, DWConvBlock, AdaptiveFourierMixer,
-    CrossScanGatedMixer, TriFuseLayer, TriStreamFusion, SkipAttention,
+    PriorKnowledgeConstructor, DCNv3Block, AdaptiveFourierMixer,
+    CrossScanGatedMixer, TriFuseLayer, TriStreamFusion,
+    FRSkipAttention, HRSkipAttention, LRSkipAttention,
     SpecMambaNet,
 )
 
@@ -15,9 +16,9 @@ def test_prior():
     assert o.shape == (2,3,224,224) and o[:,1].min()>=0
     print(f"   OK: {o.shape}")
 
-def test_dwconv():
-    print("2. DWConvBlock (FR)...")
-    m = DWConvBlock(48); o = m(torch.randn(2,48,224,224))
+def test_dcnv3():
+    print("2. DCNv3Block (FR)...")
+    m = DCNv3Block(48); o = m(torch.randn(2,48,224,224))
     assert o.shape == (2,48,224,224)
     print(f"   OK: {o.shape}, params={sum(p.numel() for p in m.parameters()):,}")
 
@@ -90,11 +91,11 @@ def test_params():
     lr = sum(p.numel() for p in model.lr_stages.parameters())
     fuse = sum(p.numel() for p in model.tri_fuse.parameters())
     print(f"   Total: {total:,}")
-    print(f"   FR(DWConv): {fr:,} | HR(FFT): {hr:,} | LR(Mamba): {lr:,}")
+    print(f"   FR(DCNv3+HDC): {fr:,} | HR(FFT+Modes): {hr:,} | LR(Mamba+Scan): {lr:,}")
     print(f"   TriFuse: {fuse:,}")
 
 if __name__ == '__main__':
-    tests = [test_prior, test_dwconv, test_afm, test_csgm, test_trifuse,
+    tests = [test_prior, test_dcnv3, test_afm, test_csgm, test_trifuse,
              test_tristream, test_full_eval, test_deep_sup, test_grads, test_params]
     print(f"\n{'='*60}\n3-Stream Asymmetric Spec-HRNet Test Suite\n{'='*60}\n")
     ok = 0

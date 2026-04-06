@@ -180,7 +180,7 @@ def train_epoch(model, loader, criterion, optimizer, device, epoch, scaler=None,
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="ACDC Training - HRNetDCN / EGMNet")
+    parser = argparse.ArgumentParser(description="ACDC Training - 3-Stream Asymmetric Spec-HRNet")
     
     # Data
     parser.add_argument('--data_dir', type=str, default='preprocessed_data/ACDC/training')
@@ -197,21 +197,22 @@ def main():
     parser.add_argument('--no_full_res', action='store_true', help='Disable full resolution mode')
     
     # Training
-    parser.add_argument('--epochs', type=int, default=200)
-    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--epochs', type=int, default=250)
+    parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-5)
-    parser.add_argument('--warmup_epochs', type=int, default=10)
-    parser.add_argument('--early_stop', type=int, default=40)
+    parser.add_argument('--warmup_epochs', type=int, default=20)
+    parser.add_argument('--early_stop', type=int, default=50)
     parser.add_argument('--use_amp', action='store_true', help='Mixed precision')
     parser.add_argument('--augment', action='store_true', help='Enable data augmentation')
     
     # Loss
-    parser.add_argument('--boundary_weight', type=float, default=0.5)
+    parser.add_argument('--boundary_weight', type=float, default=1.5)
     parser.add_argument('--dice_weight', type=float, default=1.0)
-    parser.add_argument('--ce_weight', type=float, default=1.0)
+    parser.add_argument('--ce_weight', type=float, default=0.5)
+    parser.add_argument('--focal_weight', type=float, default=0.5)
     parser.add_argument('--deep_supervision', action='store_true', help='Enable deep supervision')
-    parser.add_argument('--class_weights', type=str, default='0.1,1.5,1.5,1.0',
-                        help='Class weights for [BG,RV,MYO,LV]. Default: 0.1,1.5,1.5,1.0 (boost RV/MYO)')
+    parser.add_argument('--class_weights', type=str, default='0.1,2.5,1.5,1.0',
+                        help='Class weights for [BG,RV,MYO,LV]. Default: 0.1,2.5,1.5,1.0 (boost RV)')
     parser.add_argument('--no_class_weights', action='store_true', help='Disable class weighting')
     
     # Evaluation - defaults to 3D + TTA
@@ -274,12 +275,15 @@ def main():
     use_tta = not args.no_tta
     
     print(f"\n{'='*60}")
-    print("ACDC Training - HRNetDCN")
+    print("ACDC Training - 3-Stream Asymmetric Spec-HRNet")
     print(f"{'='*60}")
     print(f"Model:      Base Ch={args.base_channels} | Params={params:,}")
-    print(f"Features:   FullRes={'✓' if not args.no_full_res else '✗'} | PointRend={'✓' if args.use_pointrend else '✗'} | Shearlet={'✓' if args.use_shearlet else '✗'}")
+    print(f"Streams:    FR(224², DCNv3+HDC) | HR(112², FFT) | LR(56², CrossScan)")
+    print(f"Depth:      Asymmetric [2,4,6] | HDC d=[1..32] | ModePyramid | ScanPyramid")
+    print(f"Features:   PriorKnowledge=✓ | TriFuse=✓ | AsymSkipAttn=✓")
     print(f"Training:   BS={args.batch_size} | LR={args.lr} | Epochs={args.epochs}")
-    print(f"Loss:       Boundary={args.boundary_weight} | DeepSup={'✓' if args.deep_supervision else '✗'}")
+    print(f"Loss:       CE={args.ce_weight} | Focal={args.focal_weight} | Dice={args.dice_weight} | Bnd={args.boundary_weight}")
+    print(f"DeepSup:    {'✓' if args.deep_supervision else '✗'} | Warmup={args.warmup_epochs}ep")
     print(f"Eval:       {'3D' if eval_3d else '2D'} | TTA={'✓' if use_tta else '✗'}")
     print(f"Options:    AMP={'✓' if args.use_amp else '✗'}")
     
@@ -347,6 +351,7 @@ def main():
         ce_weight=args.ce_weight,
         dice_weight=args.dice_weight,
         boundary_weight=args.boundary_weight,
+        focal_weight=args.focal_weight,
         warmup_epochs=args.warmup_epochs,
         class_weights=class_weights
     )

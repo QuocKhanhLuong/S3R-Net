@@ -45,13 +45,16 @@ class DiceLoss(nn.Module):
 
 
 class FocalLoss(nn.Module):
-    def __init__(self, alpha=0.25, gamma=2.0):
+    def __init__(self, alpha=0.25, gamma=2.0, class_weights=None):
         super().__init__()
         self.alpha = alpha
         self.gamma = gamma
+        self._class_weights = class_weights
 
     def forward(self, pred, target):
-        ce = F.cross_entropy(pred, target.long(), reduction='none')
+        device = pred.device
+        cw = torch.tensor(self._class_weights, dtype=torch.float32, device=device) if self._class_weights else None
+        ce = F.cross_entropy(pred, target.long(), weight=cw, reduction='none')
         p_t = torch.exp(-ce)
         focal = (1 - p_t) ** self.gamma * ce
         return focal.mean()
@@ -184,7 +187,7 @@ class CombinedSOTALoss(nn.Module):
         self.ce = nn.CrossEntropyLoss(reduction='none')
         self.dice = DiceLoss(class_weights=None)
         self.boundary = BoundaryLoss()
-        self.focal = FocalLoss() if focal_weight > 0 else None
+        self.focal = FocalLoss(class_weights=class_weights) if focal_weight > 0 else None
 
     def set_epoch(self, epoch):
         self.current_epoch = epoch
@@ -217,10 +220,9 @@ class CombinedSOTALoss(nn.Module):
         loss += self.dice_weight * dice
         losses_dict['dice'] = dice.item()
         
-        # Boundary Loss (với warmup)
-        if self.current_epoch >= self.warmup_epochs // 2:
-            # Tăng dần boundary weight sau warmup
-            warmup_factor = min(1.0, (self.current_epoch - self.warmup_epochs // 2) / self.warmup_epochs)
+        # Boundary Loss (with warmup — starts at warmup_epochs, ramps over warmup_epochs)
+        if self.current_epoch >= self.warmup_epochs:
+            warmup_factor = min(1.0, (self.current_epoch - self.warmup_epochs) / self.warmup_epochs)
             boundary = self.boundary(pred, target)
             loss += self.boundary_weight * warmup_factor * boundary
             losses_dict['boundary'] = boundary.item()
