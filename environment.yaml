@@ -1,4 +1,4 @@
-# SpecMamba Conda Environment
+# SpecMamba / SpecUMamba — Conda environment
 # Usage: conda env create -f environment.yaml
 # Activate: conda activate specmamba
 
@@ -12,39 +12,40 @@ channels:
 
 dependencies:
   - python=3.10
-  
-  # PyTorch with CUDA 12.1 (compatible with mamba-ssm)
+
+  # PyTorch with CUDA 12.1 (Kaggle / local GPU)
   - pytorch>=2.1
   - torchvision
   - torchaudio
   - pytorch-cuda=12.1
-  
+
   # Scientific
   - numpy>=1.24
   - scipy>=1.10
   - scikit-image>=0.21
   - scikit-learn>=1.3
-  
+
   # Visualization
   - matplotlib>=3.7
   - pandas>=2.0
   - seaborn>=0.12
   - pillow>=9.5
-  
-  # Medical Imaging
+
+  # Medical imaging
   - nibabel>=5.0
   - simpleitk>=2.2
-  
+
   # Utilities
   - tqdm>=4.65
   - pyyaml>=6.0
   - h5py>=3.8
   - tensorboard>=2.13
-  
-  # Jupyter
+  - tabulate
+
+  # Jupyter / notebooks (e.g. kaggle_train.ipynb)
   - jupyter>=1.0
   - ipykernel>=6.0
-  
+
   - pip
   - pip:
     - monai>=1.2
