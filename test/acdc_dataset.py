@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
@@ -16,24 +17,107 @@ import torch.nn.functional as F
 
 
 PATIENT_RE = re.compile(r"^(patient\d+)")
+SPLIT_DIRS = ("training", "train", "validation", "val", "testing", "test")
+MASK_SUFFIXES = ("_mask", "_gt", "_seg", "_label", "_labels")
+
+
+@dataclass(frozen=True)
+class ACDCCaseRecord:
+    """Resolved volume/mask pair for one ED/ES ACDC case."""
+
+    key: str
+    case_id: str
+    split: str
+    volume_path: Path
+    mask_path: Path
 
 
 def patient_id_from_case(case_id: str) -> str:
     """Return the patient id from an ACDC case id such as `patient001_ED`."""
-    match = PATIENT_RE.match(case_id)
-    return match.group(1) if match else case_id.split("_")[0]
+    clean = Path(str(case_id)).stem
+    match = PATIENT_RE.match(clean)
+    return match.group(1) if match else clean.split("_")[0]
 
 
 def discover_acdc_cases(data_root: str | Path) -> list[str]:
     """Discover paired ACDC volume/mask case ids."""
-    root = Path(data_root)
-    volumes_dir = root / "volumes"
-    masks_dir = root / "masks"
-    if not volumes_dir.exists():
-        raise FileNotFoundError(f"Missing ACDC volumes directory: {volumes_dir}")
-    if not masks_dir.exists():
-        raise FileNotFoundError(f"Missing ACDC masks directory: {masks_dir}")
+    return sorted(discover_acdc_case_records(data_root).keys())
 
+
+def discover_acdc_case_records(data_root: str | Path) -> dict[str, ACDCCaseRecord]:
+    """Discover paired ACDC cases across supported preprocessed layouts.
+
+    Supported layouts:
+    - `ACDC/volumes/*.npy` and `ACDC/masks/*.npy`
+    - `ACDC/training/volumes/*.npy` and `ACDC/training/masks/*.npy`
+    - direct split root, e.g. `ACDC/training/volumes/*.npy`
+    - loose pairs such as `patient001_ED.npy` + `patient001_ED_gt.npy`
+      inside `training/` or an explicitly supplied split directory.
+
+    When `data_root` contains `training/` and `testing/`, only `training/` is
+    used for train/val splitting to avoid accidentally training on official
+    test data or unlabeled test cases.
+    """
+    root = Path(data_root)
+    records: dict[str, ACDCCaseRecord] = {}
+    searched: list[Path] = []
+    for split_root, split_name in _candidate_case_dirs(root):
+        searched.append(split_root)
+        for record in _records_from_case_dir(split_root, split_name):
+            if record.key in records:
+                raise ValueError(
+                    f"Duplicate ACDC case id {record.key!r}. "
+                    "Use an explicit split directory such as preprocessed_data/ACDC/training."
+                )
+            records[record.key] = record
+    if not records:
+        hint = ", ".join(str(p) for p in searched) or str(root)
+        raise FileNotFoundError(
+            "No paired ACDC .npy volume/mask files found. Expected either "
+            "`volumes/` + `masks/`, or split folders like `training/volumes/` "
+            f"+ `training/masks/`. Searched: {hint}"
+        )
+    return records
+
+
+def _candidate_case_dirs(root: Path) -> list[tuple[Path, str]]:
+    """Return directories that may contain paired cases."""
+    if _has_standard_pair_dirs(root) or _has_loose_npy_pairs(root):
+        split = root.name if root.name in SPLIT_DIRS else ""
+        return [(root, split)]
+
+    training = root / "training"
+    train = root / "train"
+    if _has_standard_pair_dirs(training) or _has_loose_npy_pairs(training):
+        return [(training, "training")]
+    if _has_standard_pair_dirs(train) or _has_loose_npy_pairs(train):
+        return [(train, "train")]
+
+    candidates = []
+    for split in SPLIT_DIRS:
+        split_root = root / split
+        if _has_standard_pair_dirs(split_root) or _has_loose_npy_pairs(split_root):
+            candidates.append((split_root, split))
+    return candidates
+
+
+def _has_standard_pair_dirs(path: Path) -> bool:
+    return (path / "volumes").exists() and (path / "masks").exists()
+
+
+def _has_loose_npy_pairs(path: Path) -> bool:
+    return path.exists() and any(path.glob("*.npy"))
+
+
+def _records_from_case_dir(case_dir: Path, split: str) -> list[ACDCCaseRecord]:
+    if _has_standard_pair_dirs(case_dir):
+        return _records_from_volume_mask_dirs(case_dir, split)
+    return _records_from_loose_dir(case_dir, split)
+
+
+def _records_from_volume_mask_dirs(case_dir: Path, split: str) -> list[ACDCCaseRecord]:
+    volumes_dir = case_dir / "volumes"
+    masks_dir = case_dir / "masks"
     volume_ids = {p.stem for p in volumes_dir.glob("*.npy")}
     mask_ids = {p.stem for p in masks_dir.glob("*.npy")}
     missing_masks = sorted(volume_ids - mask_ids)
@@ -45,7 +129,47 @@ def discover_acdc_cases(data_root: str | Path) -> list[str]:
         )
     if not volume_ids:
         raise FileNotFoundError(f"No .npy volumes found under {volumes_dir}")
-    return sorted(volume_ids)
+    return [
+        ACDCCaseRecord(
+            key=case_id,
+            case_id=case_id,
+            split=split,
+            volume_path=volumes_dir / f"{case_id}.npy",
+            mask_path=masks_dir / f"{case_id}.npy",
+        )
+        for case_id in sorted(volume_ids)
+    ]
+
+
+def _records_from_loose_dir(case_dir: Path, split: str) -> list[ACDCCaseRecord]:
+    files = {p.stem: p for p in case_dir.glob("*.npy")}
+    records = []
+    for stem, path in sorted(files.items()):
+        if any(stem.endswith(suffix) for suffix in MASK_SUFFIXES):
+            continue
+        mask_path = None
+        for suffix in MASK_SUFFIXES:
+            candidate = files.get(f"{stem}{suffix}")
+            if candidate is not None:
+                mask_path = candidate
+                break
+        if mask_path is not None:
+            records.append(
+                ACDCCaseRecord(
+                    key=stem,
+                    case_id=stem,
+                    split=split,
+                    volume_path=path,
+                    mask_path=mask_path,
+                )
+            )
+    if files and not records:
+        raise FileNotFoundError(
+            f"Found .npy files in {case_dir}, but could not pair masks. "
+            "Expected `volumes/` + `masks/`, or loose mask suffixes like "
+            "`_gt.npy` / `_mask.npy`."
+        )
+    return records
 
 
 def deterministic_patient_split(
@@ -99,8 +223,14 @@ def load_or_create_split(
         train_cases = sorted(Path(v).stem for v in splits.get("train", {}).get("volumes", []))
         val_cases = sorted(Path(v).stem for v in splits.get("val", {}).get("volumes", []))
         if train_cases and val_cases:
-            _validate_split(train_cases, val_cases, all_cases)
-            return train_cases, val_cases, manifest
+            try:
+                _validate_split(train_cases, val_cases, all_cases)
+                return train_cases, val_cases, manifest
+            except FileNotFoundError:
+                # A manifest generated for the flat repo layout is stale for
+                # a nested `training/` tree. Fall through and make a local
+                # deterministic split from discovered training cases.
+                pass
 
     train_cases, val_cases, manifest = deterministic_patient_split(
         all_cases,
@@ -132,8 +262,6 @@ class ACDCSSRSliceDataset(Dataset):
         max_cache: int = 8,
     ) -> None:
         self.data_root = Path(data_root)
-        self.volumes_dir = self.data_root / "volumes"
-        self.masks_dir = self.data_root / "masks"
         self.input_mode = str(input_mode).lower()
         if self.input_mode not in {"2d", "25d"}:
             raise ValueError("input_mode must be '2d' or '25d'")
@@ -143,15 +271,16 @@ class ACDCSSRSliceDataset(Dataset):
         self.max_cache = int(max_cache)
         self._cache: OrderedDict[int, tuple[np.ndarray, np.ndarray, int, float, float]] = OrderedDict()
 
-        all_cases = discover_acdc_cases(self.data_root)
+        self.case_records = discover_acdc_case_records(self.data_root)
+        all_cases = sorted(self.case_records)
         selected = sorted(set(case_ids or all_cases))
         missing = sorted(set(selected) - set(all_cases))
         if missing:
             raise FileNotFoundError(f"Requested ACDC cases are missing: {missing[:5]}")
 
         self.case_ids = selected
-        self.vol_paths = [self.volumes_dir / f"{case_id}.npy" for case_id in self.case_ids]
-        self.mask_paths = [self.masks_dir / f"{case_id}.npy" for case_id in self.case_ids]
+        self.vol_paths = [self.case_records[case_id].volume_path for case_id in self.case_ids]
+        self.mask_paths = [self.case_records[case_id].mask_path for case_id in self.case_ids]
         self.slice_counts: dict[int, int] = {}
         self.depth_axes: dict[int, int] = {}
         self.index_map: list[tuple[int, int]] = []
@@ -254,13 +383,20 @@ def _validate_split(train_cases: list[str], val_cases: list[str], all_cases: lis
 
 
 def _load_volume_info(data_root: Path) -> dict[str, dict[str, object]]:
-    metadata_path = data_root / "metadata.json"
-    if not metadata_path.exists():
-        return {}
-    with open(metadata_path, encoding="utf-8") as f:
-        meta = json.load(f)
-    info = meta.get("volume_info", {})
-    return info if isinstance(info, dict) else {}
+    volume_info: dict[str, dict[str, object]] = {}
+    metadata_paths = [data_root / "metadata.json"]
+    for split in SPLIT_DIRS:
+        metadata_paths.append(data_root / split / "metadata.json")
+
+    for metadata_path in metadata_paths:
+        if not metadata_path.exists():
+            continue
+        with open(metadata_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        info = meta.get("volume_info", {})
+        if isinstance(info, dict):
+            volume_info.update(info)
+    return volume_info
 
 
 def _infer_depth_axis(shape: tuple[int, int, int], expected_slices: int | None = None) -> int:

@@ -9,6 +9,29 @@ The experiment uses the existing preprocessed ACDC data under:
 preprocessed_data/ACDC
 ```
 
+Supported layouts:
+
+```bash
+preprocessed_data/ACDC/volumes/*.npy
+preprocessed_data/ACDC/masks/*.npy
+```
+
+or:
+
+```bash
+preprocessed_data/ACDC/training/volumes/*.npy
+preprocessed_data/ACDC/training/masks/*.npy
+preprocessed_data/ACDC/testing/volumes/*.npy
+preprocessed_data/ACDC/testing/masks/*.npy
+```
+
+When `training/` and `testing/` are present, train/val splitting is made from
+`training/` only. To point directly at a split directory, pass:
+
+```bash
+python test/train_ssr_acdc.py --config test/configs/ssr_v3_acdc.yaml --data_root preprocessed_data/ACDC/training
+```
+
 Do not download Kaggle data for this debug harness.
 
 ## Train
