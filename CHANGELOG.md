@@ -1,5 +1,34 @@
 # CHANGELOG.md
 
+## 2026-05-23
+
+### Added
+
+- Added an isolated SSR Phase 2 `geometry_refine: dcnv4` path in
+  `test/ssr_blocks.py`. It requires a compatible external DCNv4 extension and
+  fails clearly when the operator is not installed.
+- Added the `ssr_se_deformable` Phase 2 variant for the existing torchvision
+  `deform_conv2d` refinement path.
+
+### Changed
+
+- Updated the Phase 2 `ssr_se_dcn` variant to request `geometry_refine: dcnv4`
+  instead of the torchvision deformable-convolution path.
+- Clarified that `geometry_refine: deformable` uses
+  `torchvision.ops.deform_conv2d` and is not a verified DCNv4 operator.
+
+### Validation
+
+- Passed compile checks for the SSR phase-2 files with base Python and
+  `conda run -n alvin`.
+- Confirmed local environment does not have a DCNv4 extension; `ssr_se_dcn`
+  now fails with a clear install/error message instead of silently using
+  torchvision deformable convolution.
+- Passed a small CPU smoke train for the legacy `ssr_se_deformable` variant:
+  `conda run -n alvin python -B test/train_ssr_acdc.py --config test/configs/ssr_phase2_acdc_224.yaml --variant ssr_se_deformable --epochs 1 --max_slices 4 --batch_size 2 --image_size 64 --device cpu --num_workers 0 --output_root /private/tmp/specumamba_ssr_dcn_smoke --run_name deformable_smoke`
+- Still pending: run the `ssr_se_dcn` variant on a machine with a compatible
+  DCNv4 extension installed.
+
 ## 2026-05-11
 
 ### Added

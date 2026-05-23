@@ -27,8 +27,7 @@ def build_radial_frequency_masks(
     fx = torch.fft.rfftfreq(W, device=device)
     yy, xx = torch.meshgrid(fy, fx, indexing="ij")
     radius = torch.sqrt(xx.square() + yy.square())
-    max_radius = radius.max().clamp_min(1e-8)
-    radius = radius / max_radius
+    radius = radius / radius.max().clamp_min(1e-8)
 
     edges = torch.linspace(0.0, 1.0, num_bands + 1, device=device)
     masks = []
@@ -44,14 +43,7 @@ def build_radial_frequency_masks(
 
 
 def boundary_map_from_mask(mask: Tensor) -> Tensor:
-    """Create a 1-pixel-thick multiclass boundary map from labels.
-
-    Args:
-        mask: Tensor shaped `[B, H, W]` or `[B, 1, H, W]`.
-
-    Returns:
-        Float tensor shaped `[B, 1, H, W]`.
-    """
+    """Create a 1-pixel-thick multiclass boundary map from labels."""
     if mask.ndim == 4:
         mask_2d = mask[:, 0]
     elif mask.ndim == 3:
@@ -67,6 +59,212 @@ def boundary_map_from_mask(mask: Tensor) -> Tensor:
     boundary[:, :-1, :] |= mask_2d[:, 1:, :] != mask_2d[:, :-1, :]
     boundary &= mask_2d > 0
     return boundary.unsqueeze(1).float()
+
+
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation block for channel-wise residual update gating."""
+
+    def __init__(self, channels: int, reduction: int = 4) -> None:
+        super().__init__()
+        hidden = max(channels // max(int(reduction), 1), 1)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def gate(self, x: Tensor) -> Tensor:
+        return self.mlp(self.pool(x))
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x * self.gate(x)
+
+
+class ResidualChannelGate(nn.Module):
+    """Channel gate that inspects identity features and spectral update."""
+
+    def __init__(self, channels: int, reduction: int = 4) -> None:
+        super().__init__()
+        hidden = max(channels // max(int(reduction), 1), 1)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(channels * 2, hidden, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def gate(self, x: Tensor, delta: Tensor) -> Tensor:
+        return self.mlp(self.pool(torch.cat([x, delta], dim=1)))
+
+    def forward(self, x: Tensor, delta: Tensor) -> Tensor:
+        return delta * self.gate(x, delta)
+
+
+class LargeKernelRefine(nn.Module):
+    """Lightweight spatial geometry refinement after SSR spectral update."""
+
+    def __init__(self, channels: int, kernel_size: int = 7) -> None:
+        super().__init__()
+        if kernel_size % 2 == 0:
+            raise ValueError("large_kernel_size must be odd to preserve shape")
+        padding = kernel_size // 2
+        self.net = nn.Sequential(
+            nn.GroupNorm(_num_groups(channels), channels),
+            nn.Conv2d(channels, channels, kernel_size, padding=padding, groups=channels),
+            nn.Conv2d(channels, channels, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, kernel_size=1),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.net(x)
+
+
+class DeformableRefine(nn.Module):
+    """Optional local geometry refinement using torchvision deform_conv2d.
+
+    This is a modulated deformable-convolution path exposed by torchvision, not
+    a verified DCNv4 operator.
+    """
+
+    def __init__(self, channels: int, kernel_size: int = 3) -> None:
+        super().__init__()
+        try:
+            from torchvision.ops import deform_conv2d
+        except Exception as exc:  # pragma: no cover - depends on local install
+            raise ImportError(
+                "geometry_refine='deformable' requires torchvision.ops.deform_conv2d. "
+                "Install a torchvision build compatible with the active PyTorch."
+            ) from exc
+
+        if kernel_size % 2 == 0:
+            raise ValueError("deformable kernel_size must be odd to preserve shape")
+        self.deform_conv2d = deform_conv2d
+        self.kernel_size = int(kernel_size)
+        self.padding = self.kernel_size // 2
+        k2 = self.kernel_size * self.kernel_size
+        self.offset_conv = nn.Conv2d(channels, 2 * k2, kernel_size=3, padding=1)
+        self.mask_conv = nn.Conv2d(channels, k2, kernel_size=3, padding=1)
+        self.weight = nn.Parameter(torch.empty(channels, channels, self.kernel_size, self.kernel_size))
+        self.bias = nn.Parameter(torch.zeros(channels))
+        self.norm = nn.GroupNorm(_num_groups(channels), channels)
+        self.act = nn.GELU()
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.offset_conv.weight)
+        nn.init.zeros_(self.offset_conv.bias)
+        nn.init.zeros_(self.mask_conv.weight)
+        nn.init.zeros_(self.mask_conv.bias)
+        nn.init.kaiming_normal_(self.weight, mode="fan_out", nonlinearity="relu")
+        nn.init.zeros_(self.bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        offset = self.offset_conv(x)
+        mask = torch.sigmoid(self.mask_conv(x))
+        y = self.deform_conv2d(
+            x,
+            offset,
+            self.weight,
+            self.bias,
+            stride=(1, 1),
+            padding=(self.padding, self.padding),
+            dilation=(1, 1),
+            mask=mask,
+        )
+        return self.act(self.norm(y))
+
+
+class DCNv4Refine(nn.Module):
+    """Optional local geometry refinement using an installed DCNv4 operator.
+
+    The project does not vendor DCNv4. This wrapper only activates when a
+    compatible external DCNv4 Python module is installed in the active
+    environment. Otherwise it raises a clear error instead of silently falling
+    back to torchvision deformable conv.
+    """
+
+    def __init__(self, channels: int, kernel_size: int = 3, group: int = 4) -> None:
+        super().__init__()
+        if kernel_size % 2 == 0:
+            raise ValueError("dcnv4 kernel_size must be odd to preserve shape")
+        dcnv4_cls = _import_dcnv4_class()
+        padding = kernel_size // 2
+        group = _valid_group(channels, int(group))
+        self.dcn = self._instantiate_dcnv4(
+            dcnv4_cls,
+            channels=channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            group=group,
+        )
+        self.norm = nn.GroupNorm(_num_groups(channels), channels)
+        self.act = nn.GELU()
+
+    @staticmethod
+    def _instantiate_dcnv4(
+        dcnv4_cls: type[nn.Module],
+        *,
+        channels: int,
+        kernel_size: int,
+        padding: int,
+        group: int,
+    ) -> nn.Module:
+        kwargs = {
+            "channels": channels,
+            "kernel_size": kernel_size,
+            "stride": 1,
+            "pad": padding,
+            "dilation": 1,
+            "group": group,
+            "offset_scale": 1.0,
+        }
+        try:
+            return dcnv4_cls(**kwargs)
+        except TypeError:
+            try:
+                return dcnv4_cls(
+                    channels,
+                    kernel_size=kernel_size,
+                    stride=1,
+                    pad=padding,
+                    dilation=1,
+                    group=group,
+                    offset_scale=1.0,
+                )
+            except TypeError as exc:
+                raise TypeError(
+                    "Found a DCNv4 class, but its constructor signature is not "
+                    "compatible with this experimental wrapper."
+                ) from exc
+
+    def forward(self, x: Tensor) -> Tensor:
+        y = self._forward_dcnv4(x)
+        return self.act(self.norm(y))
+
+    def _forward_dcnv4(self, x: Tensor) -> Tensor:
+        try:
+            y = self.dcn(x)
+            if y.shape == x.shape:
+                return y
+        except Exception:
+            pass
+
+        # Several DCNv4 packages use NHWC tensors. Try that convention if NCHW
+        # did not work.
+        x_nhwc = x.permute(0, 2, 3, 1).contiguous()
+        y = self.dcn(x_nhwc)
+        if y.ndim == 4 and y.shape[-1] == x.shape[1]:
+            return y.permute(0, 3, 1, 2).contiguous()
+        if y.shape == x.shape:
+            return y
+        raise RuntimeError(
+            "DCNv4 forward returned an unexpected shape. Expected NCHW or NHWC "
+            f"compatible with {tuple(x.shape)}, got {tuple(y.shape)}."
+        )
 
 
 class _BandMLP(nn.Module):
@@ -88,12 +286,7 @@ class _BandMLP(nn.Module):
 
 
 class SSRBlockV3(nn.Module):
-    """Selective Spectral Retention Block v3.
-
-    The block splits an `rfft2` spectrum into radial bands, computes band-wise
-    spectral state features, and applies separate retain, suppress, and update
-    gates before a small local refinement and residual update.
-    """
+    """Selective Spectral Retention Block v3 with phase-2 stabilization."""
 
     def __init__(
         self,
@@ -103,9 +296,20 @@ class SSRBlockV3(nn.Module):
         min_update: float = 0.08,
         noise_strength: float = 0.04,
         retain_floor: tuple[float, ...] | list[float] = (0.15, 0.18, 0.22, 0.28),
-        suppress_max: tuple[float, ...] | list[float] = (0.10, 0.30, 0.50, 0.50),
+        suppress_min: tuple[float, ...] | list[float] = (0.00, 0.02, 0.03, 0.03),
+        suppress_max: tuple[float, ...] | list[float] = (0.05, 0.15, 0.25, 0.25),
         update_target: tuple[float, ...] | list[float] = (0.30, 0.30, 0.25, 0.15),
         noise_aware_suppress: bool = True,
+        use_bounded_gamma: bool = True,
+        gamma_max: float = 0.25,
+        gamma_init: float = -2.0,
+        residual_gate_type: str = "se_update",
+        se_reduction: int = 4,
+        geometry_refine: str = "none",
+        large_kernel_size: int = 7,
+        dcnv4_group: int = 4,
+        use_hf_ratio_penalty: bool = True,
+        hf_ratio_threshold: float = 4.0,
     ) -> None:
         super().__init__()
         self.channels = int(channels)
@@ -114,13 +318,21 @@ class SSRBlockV3(nn.Module):
         self.min_update = float(min_update)
         self.noise_strength = float(noise_strength)
         self.noise_aware_suppress = bool(noise_aware_suppress)
+        self.use_bounded_gamma = bool(use_bounded_gamma)
+        self.gamma_max = float(gamma_max)
+        self.residual_gate_type = str(residual_gate_type)
+        self.geometry_refine_type = str(geometry_refine)
+        self.use_hf_ratio_penalty = bool(use_hf_ratio_penalty)
+        self.hf_ratio_threshold = float(hf_ratio_threshold)
 
-        if len(retain_floor) != self.num_bands:
-            raise ValueError("retain_floor length must match num_bands")
-        if len(suppress_max) != self.num_bands:
-            raise ValueError("suppress_max length must match num_bands")
-        if len(update_target) != self.num_bands:
-            raise ValueError("update_target length must match num_bands")
+        for name, values in (
+            ("retain_floor", retain_floor),
+            ("suppress_min", suppress_min),
+            ("suppress_max", suppress_max),
+            ("update_target", update_target),
+        ):
+            if len(values) != self.num_bands:
+                raise ValueError(f"{name} length must match num_bands")
 
         self.retain_mlp = _BandMLP()
         self.suppress_mlp = _BandMLP()
@@ -138,11 +350,47 @@ class SSRBlockV3(nn.Module):
             nn.GELU(),
             nn.Conv2d(channels, channels, kernel_size=3, padding=1),
         )
-        self.gamma = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+
+        if self.use_bounded_gamma:
+            self.gamma_raw = nn.Parameter(torch.tensor(float(gamma_init), dtype=torch.float32))
+            self.gamma = None
+        else:
+            self.gamma = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+            self.gamma_raw = None
+
+        if self.residual_gate_type == "none":
+            self.se_update = None
+            self.residual_channel_gate = None
+        elif self.residual_gate_type == "se_update":
+            self.se_update = SEBlock(channels, reduction=se_reduction)
+            self.residual_channel_gate = None
+        elif self.residual_gate_type == "residual_channel_gate":
+            self.se_update = None
+            self.residual_channel_gate = ResidualChannelGate(channels, reduction=se_reduction)
+        else:
+            raise ValueError(
+                "residual_gate_type must be one of: none, se_update, residual_channel_gate"
+            )
+
+        if self.geometry_refine_type == "none":
+            self.geometry_refine = nn.Identity()
+        elif self.geometry_refine_type == "large_kernel":
+            self.geometry_refine = LargeKernelRefine(channels, kernel_size=large_kernel_size)
+        elif self.geometry_refine_type == "deformable":
+            self.geometry_refine = DeformableRefine(channels, kernel_size=3)
+        elif self.geometry_refine_type == "dcnv4":
+            self.geometry_refine = DCNv4Refine(channels, kernel_size=3, group=dcnv4_group)
+        else:
+            raise ValueError("geometry_refine must be one of: none, large_kernel, deformable, dcnv4")
 
         self.register_buffer(
             "retain_floor",
             torch.tensor(retain_floor, dtype=torch.float32).view(1, self.num_bands),
+            persistent=False,
+        )
+        self.register_buffer(
+            "suppress_min",
+            torch.tensor(suppress_min, dtype=torch.float32).view(1, self.num_bands),
             persistent=False,
         )
         self.register_buffer(
@@ -152,18 +400,14 @@ class SSRBlockV3(nn.Module):
         )
         target = torch.tensor(update_target, dtype=torch.float32)
         target = target / target.sum().clamp_min(1e-8)
-        self.register_buffer(
-            "update_target",
-            target.view(1, self.num_bands),
-            persistent=False,
-        )
+        self.register_buffer("update_target", target.view(1, self.num_bands), persistent=False)
 
     def forward(
         self,
         x: Tensor,
         boundary_mask: Tensor | None = None,
         return_logs: bool = False,
-    ) -> tuple[Tensor, Tensor] | tuple[Tensor, dict[str, Any], Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor] | tuple[Tensor, dict[str, Any], Tensor, Tensor]:
         """Run SSRBlockV3.
 
         Args:
@@ -199,9 +443,8 @@ class SSRBlockV3(nn.Module):
         ).sum(dim=(2, 3, 4)) / denom
 
         phase = torch.angle(X)
-        phase_denom = denom
-        cos_mean = (torch.cos(phase).unsqueeze(1) * mask_bc).sum(dim=(2, 3, 4)) / phase_denom
-        sin_mean = (torch.sin(phase).unsqueeze(1) * mask_bc).sum(dim=(2, 3, 4)) / phase_denom
+        cos_mean = (torch.cos(phase).unsqueeze(1) * mask_bc).sum(dim=(2, 3, 4)) / denom
+        sin_mean = (torch.sin(phase).unsqueeze(1) * mask_bc).sum(dim=(2, 3, 4)) / denom
         phase_coherence = torch.sqrt(cos_mean.square() + sin_mean.square()).clamp(0.0, 1.0)
 
         features = torch.stack(
@@ -213,15 +456,21 @@ class SSRBlockV3(nn.Module):
         raw_update = self.update_mlp(features)
 
         retain_gate = self.retain_floor + (1.0 - self.retain_floor) * torch.sigmoid(raw_retain)
-
         remaining_budget = max(self.update_budget - self.num_bands * self.min_update, 0.0)
         update_gate = self.min_update + remaining_budget * torch.softmax(raw_update, dim=1)
 
-        energy_norm = energy / energy.mean(dim=1, keepdim=True).clamp_min(eps)
-        noise_score = (energy_norm * (1.0 - phase_coherence)).clamp(0.0, 2.0) / 2.0
-        if not self.noise_aware_suppress:
-            noise_score = torch.ones_like(noise_score)
-        suppress_gate = self.suppress_max * torch.sigmoid(raw_suppress) * noise_score
+        base_suppress = torch.sigmoid(raw_suppress)
+        if self.noise_aware_suppress:
+            energy_norm = energy / energy.mean(dim=1, keepdim=True).clamp_min(eps)
+            noise_score = (energy_norm * (1.0 - phase_coherence)).clamp(0.0, 2.0) / 2.0
+            noise_score = 0.25 + 0.75 * noise_score
+            suppress_gate = self.suppress_min + (
+                self.suppress_max - self.suppress_min
+            ) * base_suppress * noise_score
+        else:
+            suppress_gate = self.suppress_min + (
+                self.suppress_max - self.suppress_min
+            ) * base_suppress
 
         gate_reg = F.mse_loss(
             update_gate.mean(dim=0),
@@ -235,6 +484,8 @@ class SSRBlockV3(nn.Module):
         update_contrib = []
         suppress_contrib = []
         high_band_energy_map = None
+        in_high = None
+        out_high = None
 
         for band in range(self.num_bands):
             mask = masks[band].view(1, 1, H, Wf)
@@ -244,13 +495,14 @@ class SSRBlockV3(nn.Module):
 
             retain = retain_gate[:, band].view(B, 1, 1, 1) * xk
             update = update_gate[:, band].view(B, 1, 1, 1) * delta
-            suppress = (
-                self.noise_strength
-                * suppress_gate[:, band].view(B, 1, 1, 1)
-                * noise_like
-            )
+            suppress = self.noise_strength * suppress_gate[:, band].view(B, 1, 1, 1) * noise_like
             out_k = retain + update - suppress
             band_outputs.append(out_k)
+
+            if band == self.num_bands - 1:
+                in_high = xk.square().mean(dim=(1, 2, 3))
+                out_high = out_k.square().mean(dim=(1, 2, 3))
+                high_band_energy_map = xk.square().mean(dim=1, keepdim=True)
 
             if return_logs:
                 input_energy.append(xk.square().mean(dim=(1, 2, 3)))
@@ -258,21 +510,30 @@ class SSRBlockV3(nn.Module):
                 retain_contrib.append(retain.abs().mean(dim=(1, 2, 3)))
                 update_contrib.append(update.abs().mean(dim=(1, 2, 3)))
                 suppress_contrib.append(suppress.abs().mean(dim=(1, 2, 3)))
-                if band == self.num_bands - 1:
-                    high_band_energy_map = xk.square().mean(dim=1, keepdim=True)
+
+        if in_high is None or out_high is None:
+            raise RuntimeError("High-frequency band was not computed.")
+        hf_ratio = out_high / in_high.clamp_min(eps)
+        if self.use_hf_ratio_penalty:
+            hf_ratio_penalty = F.relu(hf_ratio - self.hf_ratio_threshold).square().mean()
+        else:
+            hf_ratio_penalty = torch.zeros((), device=x.device, dtype=x_float.dtype)
 
         spectral_out = torch.stack(band_outputs, dim=0).sum(dim=0)
         spectral_out = self.local_refine(spectral_out)
-        y = x + self.gamma.to(x.dtype) * spectral_out.to(x.dtype)
+        gated_update, residual_gate = self._apply_residual_gate(x_float, spectral_out)
+        gated_update = self.geometry_refine(gated_update)
+        gamma = self._gamma_value().to(x_float.dtype)
+        y = x_float + gamma * gated_update
+        y = y.to(x.dtype)
 
         if not return_logs:
-            return y, gate_reg
+            return y, gate_reg, hf_ratio_penalty
 
         logs = self._build_logs(
             retain_gate=retain_gate,
             suppress_gate=suppress_gate,
             update_gate=update_gate,
-            energy=energy,
             variance=variance,
             phase_coherence=phase_coherence,
             input_energy=torch.stack(input_energy, dim=1),
@@ -283,8 +544,30 @@ class SSRBlockV3(nn.Module):
             high_band_energy_map=high_band_energy_map,
             boundary_mask=boundary_mask,
             gate_reg=gate_reg,
+            hf_ratio=hf_ratio,
+            hf_ratio_penalty=hf_ratio_penalty,
+            gamma=gamma,
+            residual_gate=residual_gate,
         )
-        return y, logs, gate_reg
+        return y, logs, gate_reg, hf_ratio_penalty
+
+    def _gamma_value(self) -> Tensor:
+        if self.use_bounded_gamma:
+            assert self.gamma_raw is not None
+            return self.gamma_max * torch.sigmoid(self.gamma_raw)
+        assert self.gamma is not None
+        return self.gamma
+
+    def _apply_residual_gate(self, x: Tensor, delta: Tensor) -> tuple[Tensor, Tensor | None]:
+        if self.residual_gate_type == "none":
+            return delta, None
+        if self.residual_gate_type == "se_update":
+            assert self.se_update is not None
+            gate = self.se_update.gate(delta)
+            return delta * gate, gate
+        assert self.residual_channel_gate is not None
+        gate = self.residual_channel_gate.gate(x, delta)
+        return delta * gate, gate
 
     def _build_logs(
         self,
@@ -292,7 +575,6 @@ class SSRBlockV3(nn.Module):
         retain_gate: Tensor,
         suppress_gate: Tensor,
         update_gate: Tensor,
-        energy: Tensor,
         variance: Tensor,
         phase_coherence: Tensor,
         input_energy: Tensor,
@@ -303,6 +585,10 @@ class SSRBlockV3(nn.Module):
         high_band_energy_map: Tensor | None,
         boundary_mask: Tensor | None,
         gate_reg: Tensor,
+        hf_ratio: Tensor,
+        hf_ratio_penalty: Tensor,
+        gamma: Tensor,
+        residual_gate: Tensor | None,
     ) -> dict[str, Any]:
         """Build detached scalar/list logs for CSV serialization."""
         eps = 1e-8
@@ -327,14 +613,16 @@ class SSRBlockV3(nn.Module):
             "retain_contribution": per_band_mean(retain_contrib),
             "update_contribution": per_band_mean(update_contrib),
             "suppress_contribution": per_band_mean(suppress_contrib),
+            "high_freq_ratio": float(hf_ratio.detach().mean().cpu()),
+            "high_freq_penalty": float(hf_ratio_penalty.detach().cpu()),
             "update_budget_sum": float(update_gate.detach().sum(dim=1).mean().cpu()),
             "gate_reg": float(gate_reg.detach().cpu()),
-            "gamma": float(self.gamma.detach().cpu()),
+            "gamma": float(gamma.detach().cpu()),
         }
-
-        in_high = input_energy[:, -1].mean()
-        out_high = output_energy[:, -1].mean()
-        logs["high_freq_ratio"] = float((out_high / in_high.clamp_min(eps)).detach().cpu())
+        if residual_gate is not None:
+            gate_flat = residual_gate.detach().flatten(1)
+            logs["residual_gate_mean"] = float(gate_flat.mean().cpu())
+            logs["residual_gate_std"] = float(gate_flat.std(unbiased=False).cpu())
 
         boundary_density = torch.tensor(0.0, device=input_energy.device)
         nonboundary_density = torch.tensor(0.0, device=input_energy.device)
@@ -365,3 +653,35 @@ def _num_groups(channels: int) -> int:
         if channels % groups == 0:
             return groups
     return 1
+
+
+def _valid_group(channels: int, requested: int) -> int:
+    for group in (requested, 4, 2, 1):
+        if group > 0 and channels % group == 0:
+            return group
+    return 1
+
+
+def _import_dcnv4_class() -> type[nn.Module]:
+    candidates = (
+        ("DCNv4.modules.dcnv4", "DCNv4"),
+        ("DCNv4.dcnv4", "DCNv4"),
+        ("dcnv4.modules.dcnv4", "DCNv4"),
+        ("dcnv4", "DCNv4"),
+    )
+    errors: list[str] = []
+    for module_name, class_name in candidates:
+        try:
+            module = __import__(module_name, fromlist=[class_name])
+            cls = getattr(module, class_name)
+            if not issubclass(cls, nn.Module):
+                raise TypeError(f"{module_name}.{class_name} is not an nn.Module")
+            return cls
+        except Exception as exc:
+            errors.append(f"{module_name}.{class_name}: {exc}")
+    raise ImportError(
+        "geometry_refine='dcnv4' requires an installed DCNv4 operator. "
+        "This repo does not vendor DCNv4; install the OpenGVLab/DCNv4 extension "
+        "or use geometry_refine='deformable' for the torchvision DCNv2-style path. "
+        "Tried: " + " | ".join(errors)
+    )

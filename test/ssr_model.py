@@ -32,10 +32,11 @@ class MiniSSRSegNetV3(nn.Module):
     """Minimal SSR segmentation network for controlled ACDC experiments.
 
     Input shape: `[B, in_channels, H, W]`.
-    Output dictionary:
+        Output dictionary:
         `seg_logits`: `[B, num_classes, H, W]`
         `boundary_logits`: `[B, 1, H, W]`
         `gate_reg`: scalar regularization tensor
+        `hf_ratio_penalty`: scalar high-frequency amplification penalty tensor
         `logs`: optional SSR diagnostics when `return_logs=True`
     """
 
@@ -73,25 +74,25 @@ class MiniSSRSegNetV3(nn.Module):
         feat = self.stem(x)
 
         if return_logs:
-            feat, ssr1_logs, gate_reg1 = self.ssr1(
+            feat, ssr1_logs, gate_reg1, hf_penalty1 = self.ssr1(
                 feat,
                 boundary_mask=boundary_mask,
                 return_logs=True,
             )
         else:
-            feat, gate_reg1 = self.ssr1(feat, boundary_mask=boundary_mask)
+            feat, gate_reg1, hf_penalty1 = self.ssr1(feat, boundary_mask=boundary_mask)
             ssr1_logs = {}
 
         feat = self.mid(feat)
 
         if return_logs:
-            feat, ssr2_logs, gate_reg2 = self.ssr2(
+            feat, ssr2_logs, gate_reg2, hf_penalty2 = self.ssr2(
                 feat,
                 boundary_mask=boundary_mask,
                 return_logs=True,
             )
         else:
-            feat, gate_reg2 = self.ssr2(feat, boundary_mask=boundary_mask)
+            feat, gate_reg2, hf_penalty2 = self.ssr2(feat, boundary_mask=boundary_mask)
             ssr2_logs = {}
 
         feat = self.shared_head(feat)
@@ -99,6 +100,7 @@ class MiniSSRSegNetV3(nn.Module):
             "seg_logits": self.seg_head(feat),
             "boundary_logits": self.boundary_head(feat),
             "gate_reg": gate_reg1 + gate_reg2,
+            "hf_ratio_penalty": hf_penalty1 + hf_penalty2,
         }
         if return_logs:
             outputs["logs"] = {

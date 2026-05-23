@@ -70,3 +70,74 @@ python test/analyze_ssr_logs.py --run_dir test/outputs/ssr_v3_acdc_debug
   a final performance claim.
 
 Generated artifacts are written to `test/outputs/<run_name>/`.
+
+## Phase Test 2
+
+Phase Test 2 adds config-controlled ablations for channel-aware residual gating,
+bounded residual strength, high-frequency ratio regularization, suppress floors,
+and optional geometry refinement. It is still a controlled experiment, not a
+final paper model or performance claim.
+
+Default phase-2 run:
+
+```bash
+python test/train_ssr_acdc.py --config test/configs/ssr_phase2_acdc_224.yaml
+```
+
+Run a variant:
+
+```bash
+python test/train_ssr_acdc.py \
+  --config test/configs/ssr_phase2_acdc_224.yaml \
+  --variant ssr_se_bounded
+```
+
+Smoke test:
+
+```bash
+python test/train_ssr_acdc.py \
+  --config test/configs/ssr_phase2_acdc_224.yaml \
+  --epochs 2 \
+  --max_slices 32 \
+  --batch_size 8
+```
+
+Analyze:
+
+```bash
+python test/analyze_ssr_logs.py --run_dir test/outputs/ssr_phase2_acdc_224
+```
+
+CLI overrides:
+
+```bash
+--epochs --batch_size --image_size --max_slices --run_name --device --variant
+```
+
+Variants:
+
+- `baseline_ssr`: current SSR without SE, gamma bound, or high-frequency ratio penalty.
+- `ssr_se`: adds SE gating on the spectral update.
+- `ssr_se_bounded`: adds SE, bounded gamma, and high-frequency ratio penalty.
+- `ssr_se_lk`: adds large-kernel geometry refinement.
+- `ssr_se_dcn`: adds the DCNv4 geometry refinement path. This requires an
+  installed compatible DCNv4 extension and fails clearly if it is unavailable.
+- `ssr_se_deformable`: legacy torchvision deformable-conv refinement using
+  `torchvision.ops.deform_conv2d`; this is not DCNv4.
+- `ssr_full`: uses residual channel gate plus large-kernel geometry refinement.
+
+Expected behavior to inspect:
+
+- `high_freq_ratio` should decrease compared with Phase 1.
+- `boundary_to_nonboundary_high_ratio` should stay above 1.5.
+- suppress gates should not stay all zero and should not saturate.
+- validation Dice should remain competitive.
+- prediction grids should show fewer LV holes and fewer small false positives.
+
+Notes:
+
+- The trainer automatically retries CUDA OOM by halving batch size: 8 to 4 to 2 to 1.
+- If CUDA is unavailable, it falls back to CPU and uses `num_workers=0` for local stability.
+- `geometry_refine: dcnv4` is the only Phase 2 path intended to mean DCNv4.
+- `geometry_refine: deformable` uses torchvision `deform_conv2d`, which is a
+  modulated deformable-conv path and should not be described as DCNv4.
