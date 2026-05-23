@@ -246,23 +246,21 @@ class DCNv4Refine(nn.Module):
         return self.act(self.norm(y))
 
     def _forward_dcnv4(self, x: Tensor) -> Tensor:
+        B, C, H, W = x.shape
+        x_flat = x.permute(0, 2, 3, 1).contiguous().view(B, H * W, C)
         try:
-            y = self.dcn(x)
-            if y.shape == x.shape:
-                return y
-        except Exception:
-            pass
-
-        # Several DCNv4 packages use NHWC tensors. Try that convention if NCHW
-        # did not work.
-        x_nhwc = x.permute(0, 2, 3, 1).contiguous()
-        y = self.dcn(x_nhwc)
-        if y.ndim == 4 and y.shape[-1] == x.shape[1]:
+            y = self.dcn(x_flat, shape=(H, W))
+        except TypeError:
+            y = self.dcn(x_flat)
+        if y.ndim == 3 and y.shape == (B, H * W, C):
+            return y.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+        if y.ndim == 4 and y.shape[-1] == C:
             return y.permute(0, 3, 1, 2).contiguous()
         if y.shape == x.shape:
             return y
         raise RuntimeError(
-            "DCNv4 forward returned an unexpected shape. Expected NCHW or NHWC "
+            "DCNv4 forward returned an unexpected shape. Expected flattened "
+            "[B,H*W,C], NHWC, or NCHW output "
             f"compatible with {tuple(x.shape)}, got {tuple(y.shape)}."
         )
 
@@ -657,9 +655,12 @@ def _num_groups(channels: int) -> int:
 
 def _valid_group(channels: int, requested: int) -> int:
     for group in (requested, 4, 2, 1):
-        if group > 0 and channels % group == 0:
+        if group > 0 and channels % group == 0 and (channels // group) % 16 == 0:
             return group
-    return 1
+    raise ValueError(
+        "DCNv4 requires channels/group to be divisible by 16. "
+        f"Got channels={channels}, requested group={requested}."
+    )
 
 
 def _import_dcnv4_class() -> type[nn.Module]:

@@ -47,7 +47,7 @@ ssr:
 
   geometry_refine: none
   large_kernel_size: 7
-  dcnv4_group: 4
+  dcnv4_group: 2
 
   use_hf_ratio_penalty: true
   hf_ratio_threshold: 4.0
@@ -92,7 +92,7 @@ variants:
     ssr:
       residual_gate_type: se_update
       geometry_refine: dcnv4
-      dcnv4_group: 4
+      dcnv4_group: 2
       use_bounded_gamma: true
       gamma_max: 0.25
     loss_weights:

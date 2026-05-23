@@ -139,5 +139,9 @@ Notes:
 - The trainer automatically retries CUDA OOM by halving batch size: 8 to 4 to 2 to 1.
 - If CUDA is unavailable, it falls back to CPU and uses `num_workers=0` for local stability.
 - `geometry_refine: dcnv4` is the only Phase 2 path intended to mean DCNv4.
+- The DCNv4 wrapper follows the upstream channel constraint: `channels / dcnv4_group`
+  must be divisible by 16. With the default `base_channels: 32`, keep
+  `dcnv4_group: 2`; if you increase `base_channels` to 64, `dcnv4_group: 4`
+  is also valid.
 - `geometry_refine: deformable` uses torchvision `deform_conv2d`, which is a
   modulated deformable-conv path and should not be described as DCNv4.

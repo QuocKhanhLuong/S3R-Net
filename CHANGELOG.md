@@ -14,6 +14,9 @@
 
 - Updated the Phase 2 `ssr_se_dcn` variant to request `geometry_refine: dcnv4`
   instead of the torchvision deformable-convolution path.
+- Set `dcnv4_group: 2` for the default `base_channels: 32` phase-2 model,
+  matching the upstream DCNv4 requirement that `channels / group` is divisible
+  by 16.
 - Clarified that `geometry_refine: deformable` uses
   `torchvision.ops.deform_conv2d` and is not a verified DCNv4 operator.
 
