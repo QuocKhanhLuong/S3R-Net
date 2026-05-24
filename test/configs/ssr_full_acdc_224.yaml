@@ -1,0 +1,101 @@
+run_name: ssr_full_25d_seed42
+seed: 42
+data_root: preprocessed_data/ACDC
+output_root: test/outputs
+
+variant: ssr_full
+input_mode: 25d
+in_channels: 5
+image_size: 224
+foreground_only: true
+
+batch_size: 8
+num_workers: 4
+epochs: 200
+lr: 0.0003
+weight_decay: 0.0001
+grad_clip: 3.0
+device: cuda
+
+base_channels: 32
+num_classes: 4
+num_bands: 4
+
+loss_weights:
+  boundary_bce: 0.50
+  boundary_dice: 0.30
+  boundary_frequency: 0.20
+  tv: 0.05
+  gate_reg: 0.03
+  hf_ratio: 0.005
+
+metrics:
+  surface_tolerance: 2
+  compute_hd95: true
+  compute_assd: true
+  compute_boundary_f1: true
+  compute_surface_dice: true
+  spacing_aware: false
+  full_every_n_epochs: 1
+
+ssr:
+  update_budget: 1.5
+  min_update: 0.08
+  noise_strength: 0.04
+  retain_floor: [0.15, 0.18, 0.22, 0.28]
+  suppress_min: [0.00, 0.02, 0.03, 0.03]
+  suppress_max: [0.05, 0.15, 0.25, 0.25]
+  update_target: [0.30, 0.30, 0.25, 0.15]
+  noise_aware_suppress: true
+
+  use_bounded_gamma: true
+  gamma_max: 0.25
+  gamma_init: -2.0
+
+  residual_gate_type: residual_channel_gate
+  residual_gate_max: 0.6
+  se_reduction: 4
+
+  geometry_refine: large_kernel
+  large_kernel_size: 7
+  dcnv4_group: 2
+
+  use_hf_ratio_penalty: true
+  hf_ratio_threshold: 4.0
+
+robustness:
+  enabled: true
+  gaussian_noise_sigmas: [0.05, 0.10, 0.15]
+  blur_sigmas: [0.75, 1.25, 1.75]
+  contrast_factors: [0.75, 1.25, 1.50]
+  gamma_values: [0.7, 1.5]
+
+variants:
+  baseline_ssr:
+    ssr:
+      residual_gate_type: none
+      geometry_refine: none
+      use_bounded_gamma: false
+    loss_weights:
+      hf_ratio: 0.0
+
+  ssr_se_lk:
+    ssr:
+      residual_gate_type: se_update
+      geometry_refine: large_kernel
+      large_kernel_size: 7
+      use_bounded_gamma: true
+      gamma_max: 0.25
+    loss_weights:
+      hf_ratio: 0.005
+
+  ssr_full:
+    ssr:
+      residual_gate_type: residual_channel_gate
+      residual_gate_max: 0.6
+      geometry_refine: large_kernel
+      large_kernel_size: 7
+      use_bounded_gamma: true
+      gamma_max: 0.25
+    loss_weights:
+      hf_ratio: 0.005

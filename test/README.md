@@ -178,3 +178,112 @@ Notes:
   is also valid.
 - `geometry_refine: deformable` uses torchvision `deform_conv2d`, which is a
   modulated deformable-conv path and should not be described as DCNv4.
+
+## SSR Full Validation Suite
+
+This suite is for the current best debug candidate, `ssr_full`. It adds
+multi-seed 2D/2.5D runs, pixel-based surface metrics, robustness evaluation,
+and aggregate reports. These outputs are still experimental evidence only.
+
+Smoke test:
+
+```bash
+python test/train_ssr_acdc.py \
+  --config test/configs/ssr_full_acdc_224.yaml \
+  --epochs 2 \
+  --max_slices 32 \
+  --batch_size 8 \
+  --run_name smoke_ssr_full
+```
+
+Train one 2D seed:
+
+```bash
+python test/train_ssr_acdc.py \
+  --config test/configs/ssr_full_acdc_224.yaml \
+  --variant ssr_full \
+  --input_mode 2d \
+  --in_channels 1 \
+  --seed 42 \
+  --run_name ssr_full_2d_seed42
+```
+
+Train one 2.5D seed:
+
+```bash
+python test/train_ssr_acdc.py \
+  --config test/configs/ssr_full_acdc_224.yaml \
+  --variant ssr_full \
+  --input_mode 25d \
+  --in_channels 5 \
+  --seed 42 \
+  --run_name ssr_full_25d_seed42
+```
+
+Run the default server suite. This defaults to 2.5D, batch size 8, 200 epochs,
+and full slices:
+
+```bash
+bash test/run_ssr_full_suite.sh
+```
+
+Run both 2D and 2.5D seed suites:
+
+```bash
+MODE=train_all bash test/run_ssr_full_suite.sh
+```
+
+Useful server overrides:
+
+```bash
+PYTHON_BIN=python \
+OUTPUT_ROOT=test/outputs \
+DEVICE=cuda \
+BATCH_SIZE=8 \
+EPOCHS=200 \
+MODE=train_25d \
+bash test/run_ssr_full_suite.sh
+```
+
+Leave `MAX_SLICES` unset for full-slice training. For a quick capped run:
+
+```bash
+MAX_SLICES=32 EPOCHS=2 bash test/run_ssr_full_suite.sh
+```
+
+Run robustness for a completed run:
+
+```bash
+python test/evaluate_robustness.py \
+  --run_dir test/outputs/ssr_full_2d_seed42
+```
+
+Aggregate completed runs:
+
+```bash
+python test/aggregate_ssr_results.py \
+  --output_root test/outputs \
+  --pattern "ssr_full_*"
+```
+
+Or use the Python launcher directly:
+
+```bash
+python test/run_ssr_full_suite.py \
+  --config test/configs/ssr_full_acdc_224.yaml \
+  --mode train_all
+```
+
+Expected validation outputs per run:
+
+- `training_log.csv`: Dice, loss parts, HD95, ASSD, Boundary F1, Surface Dice.
+- `ssr_logs.csv`: gate, contribution, gamma, high-frequency, and boundary-ratio diagnostics.
+- `best_model.pt` and `final_model.pt`.
+- `robustness_metrics.csv` and robustness plots after robustness evaluation.
+- aggregate reports under `test/outputs/ssr_full_aggregate/`.
+
+Metric notes:
+
+- HD95 and ASSD are pixel-based unless spacing metadata is added later.
+- Empty ground-truth classes are skipped with `NaN` and foreground means use nanmean.
+- Boundary F1 and Surface Dice use `metrics.surface_tolerance`, default 2 pixels.

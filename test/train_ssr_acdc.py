@@ -7,6 +7,7 @@ import argparse
 import copy
 import csv
 import json
+import math
 import os
 import random
 import sys
@@ -30,6 +31,7 @@ except ImportError as exc:  # pragma: no cover
 
 from acdc_dataset import ACDCSSRSliceDataset, load_or_create_split
 from ssr_blocks import boundary_map_from_mask, build_radial_frequency_masks
+from ssr_metrics import HAS_SCIPY, segmentation_surface_metrics
 from ssr_model import MiniSSRSegNetV3
 
 
@@ -46,6 +48,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run_name", default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--variant", default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--input_mode", choices=["2d", "25d"], default=None)
+    parser.add_argument("--in_channels", type=int, default=None)
     parser.add_argument("--data_root", default=None)
     parser.add_argument("--output_root", default=None)
     parser.add_argument("--num_workers", type=int, default=None)
@@ -74,6 +79,7 @@ def apply_config_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
     cfg.setdefault("data_root", "preprocessed_data/ACDC")
     cfg.setdefault("output_root", "test/outputs")
     cfg.setdefault("input_mode", "2d")
+    cfg.setdefault("in_channels", 5 if str(cfg["input_mode"]).lower() == "25d" else 1)
     cfg.setdefault("image_size", 128)
     cfg.setdefault("foreground_only", True)
     cfg.setdefault("batch_size", 4)
@@ -96,6 +102,15 @@ def apply_config_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
     loss_weights.setdefault("tv", 0.05)
     loss_weights.setdefault("gate_reg", 0.03)
     loss_weights.setdefault("hf_ratio", 0.005)
+
+    metrics = cfg.setdefault("metrics", {})
+    metrics.setdefault("surface_tolerance", 2)
+    metrics.setdefault("compute_hd95", True)
+    metrics.setdefault("compute_assd", True)
+    metrics.setdefault("compute_boundary_f1", True)
+    metrics.setdefault("compute_surface_dice", True)
+    metrics.setdefault("spacing_aware", False)
+    metrics.setdefault("full_every_n_epochs", 1)
 
     ssr = cfg.setdefault("ssr", {})
     ssr.setdefault("update_budget", 1.5)
@@ -138,6 +153,9 @@ def apply_variant_and_cli(cfg: dict[str, Any], args: argparse.Namespace) -> dict
         "max_slices",
         "run_name",
         "device",
+        "seed",
+        "input_mode",
+        "in_channels",
         "data_root",
         "output_root",
         "num_workers",
@@ -145,6 +163,8 @@ def apply_variant_and_cli(cfg: dict[str, Any], args: argparse.Namespace) -> dict
         value = getattr(args, key)
         if value is not None:
             cfg[key] = value
+    if args.input_mode is not None and args.in_channels is None:
+        cfg["in_channels"] = 5 if str(args.input_mode).lower() == "25d" else 1
     return apply_config_defaults(cfg)
 
 
@@ -216,7 +236,7 @@ def make_loaders(cfg: dict[str, Any]) -> tuple[DataLoader, DataLoader, dict[str,
 
 
 def build_model(cfg: dict[str, Any]) -> MiniSSRSegNetV3:
-    in_channels = 5 if str(cfg["input_mode"]).lower() == "25d" else 1
+    in_channels = int(cfg.get("in_channels") or (5 if str(cfg["input_mode"]).lower() == "25d" else 1))
     ssr_cfg = dict(cfg.get("ssr", {}))
     ssr_cfg.setdefault("num_bands", int(cfg["num_bands"]))
     return MiniSSRSegNetV3(
@@ -331,6 +351,8 @@ def run_epoch(
     denom = torch.zeros(num_classes, device=device)
     ssr_rows: list[dict[str, Any]] = []
     detailed_logs: dict[str, Any] | None = None
+    surface_values: dict[str, list[float]] = {key: [] for key in surface_metric_keys()}
+    compute_surface = (not training) and should_compute_surface_metrics(cfg, epoch)
 
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
@@ -363,6 +385,18 @@ def run_epoch(
                 inter[cls] += (pred_c & target_c).sum()
                 denom[cls] += pred_c.sum() + target_c.sum()
 
+            if compute_surface:
+                batch_surface = segmentation_surface_metrics(
+                    preds.detach().cpu().numpy(),
+                    masks.detach().cpu().numpy(),
+                    num_classes=num_classes,
+                    tolerance=float(cfg.get("metrics", {}).get("surface_tolerance", 2)),
+                    spacing=None,
+                )
+                for key, value in batch_surface.items():
+                    if key in surface_values and value is not None:
+                        surface_values[key].append(float(value))
+
             if return_logs:
                 detailed_logs = outputs.get("logs")
                 ssr_rows.extend(flatten_ssr_logs(epoch, split, detailed_logs))
@@ -373,7 +407,61 @@ def run_epoch(
         metrics[f"dice_{name}"] = float(dice[cls].detach().cpu())
     fg_keys = [f"dice_{name}" for name in CLASS_NAMES[1:num_classes]]
     metrics["fg_dice"] = float(np.mean([metrics[k] for k in fg_keys])) if fg_keys else metrics["dice_BG"]
+    for key, vals in surface_values.items():
+        metrics[key] = nanmean_or_nan(vals)
     return metrics, ssr_rows, detailed_logs
+
+
+def surface_metric_keys() -> list[str]:
+    return [
+        "hd95_rv",
+        "hd95_myo",
+        "hd95_lv",
+        "hd95_fg_mean",
+        "assd_rv",
+        "assd_myo",
+        "assd_lv",
+        "assd_fg_mean",
+        "boundary_f1_rv",
+        "boundary_f1_myo",
+        "boundary_f1_lv",
+        "boundary_f1_fg",
+        "surface_dice_rv",
+        "surface_dice_myo",
+        "surface_dice_lv",
+        "surface_dice_fg",
+    ]
+
+
+def should_compute_surface_metrics(cfg: dict[str, Any], epoch: int) -> bool:
+    metrics_cfg = cfg.get("metrics", {})
+    enabled = any(
+        bool(metrics_cfg.get(key, True))
+        for key in ("compute_hd95", "compute_assd", "compute_boundary_f1", "compute_surface_dice")
+    )
+    if not enabled:
+        return False
+    if not HAS_SCIPY:
+        raise ImportError("Validation surface metrics require scipy.ndimage. Install scipy or disable metrics in config.")
+    every = int(metrics_cfg.get("full_every_n_epochs", 1) or 1)
+    return epoch == 1 or epoch % every == 0 or epoch == int(cfg.get("epochs", epoch))
+
+
+def nanmean_or_nan(values: list[float]) -> float:
+    if not values:
+        return math.nan
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0 or np.isnan(arr).all():
+        return math.nan
+    return float(np.nanmean(arr))
+
+
+def finite_or_none(value: Any) -> float | None:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
 
 
 def flatten_ssr_logs(epoch: int, split: str, logs: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -577,6 +665,8 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
     training_rows: list[dict[str, Any]] = []
     ssr_rows: list[dict[str, Any]] = []
     best_val = -1.0
+    best_hd95 = float("inf")
+    best_hd95_epoch = 0
     best_epoch = 0
     best_row: dict[str, Any] | None = None
 
@@ -618,6 +708,16 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
             "val_tv": val_metrics["tv"],
             "val_gate_reg": val_metrics["gate_reg"],
             "val_hf_ratio_penalty": val_metrics["hf_ratio_penalty"],
+            "val_hd95_rv": val_metrics.get("hd95_rv", math.nan),
+            "val_hd95_myo": val_metrics.get("hd95_myo", math.nan),
+            "val_hd95_lv": val_metrics.get("hd95_lv", math.nan),
+            "val_hd95_fg_mean": val_metrics.get("hd95_fg_mean", math.nan),
+            "val_assd_rv": val_metrics.get("assd_rv", math.nan),
+            "val_assd_myo": val_metrics.get("assd_myo", math.nan),
+            "val_assd_lv": val_metrics.get("assd_lv", math.nan),
+            "val_assd_fg_mean": val_metrics.get("assd_fg_mean", math.nan),
+            "val_boundary_f1_fg": val_metrics.get("boundary_f1_fg", math.nan),
+            "val_surface_dice_fg": val_metrics.get("surface_dice_fg", math.nan),
         }
         training_rows.append(row)
 
@@ -626,6 +726,11 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
             best_epoch = epoch
             best_row = dict(row)
             torch.save({"epoch": epoch, "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(), "val_fg_mean": best_val, "config": cfg}, run_dir / "best_model.pt")
+        hd95_value = float(row.get("val_hd95_fg_mean", math.nan))
+        if math.isfinite(hd95_value) and hd95_value < best_hd95:
+            best_hd95 = hd95_value
+            best_hd95_epoch = epoch
+            torch.save({"epoch": epoch, "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(), "val_hd95_fg_mean": best_hd95, "config": cfg}, run_dir / "best_hd95_model.pt")
 
         write_csv(run_dir / "training_log.csv", training_rows)
         write_csv(run_dir / "ssr_logs.csv", ssr_rows, ["epoch", "split", "block", "metric", "band", "value"])
@@ -635,6 +740,7 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
             f"train_loss={train_metrics['loss']:.4f} val_loss={val_metrics['loss']:.4f} "
             f"train_fg={train_metrics['fg_dice']:.4f} val_fg={val_metrics['fg_dice']:.4f} "
             f"RV={val_metrics.get('dice_RV', 0.0):.4f} MYO={val_metrics.get('dice_MYO', 0.0):.4f} LV={val_metrics.get('dice_LV', 0.0):.4f} "
+            f"hd95={val_metrics.get('hd95_fg_mean', math.nan):.3f} bf1={val_metrics.get('boundary_f1_fg', math.nan):.4f} "
             f"bfreq={val_metrics['boundary_frequency']:.4f} hf_pen={val_metrics['hf_ratio_penalty']:.4f} "
             f"gate_reg={val_metrics['gate_reg']:.5f}"
         )
@@ -651,14 +757,27 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
     summary = {
         "run_name": cfg["run_name"],
         "variant": cfg.get("variant", "default"),
+        "seed": int(cfg["seed"]),
         "best_epoch": best_epoch,
         "best_val_fg_mean": best_val,
         "best_val_fg_dice": best_val,
         "best_val_dice_RV": (best_row or {}).get("val_dice_RV", 0.0),
         "best_val_dice_MYO": (best_row or {}).get("val_dice_MYO", 0.0),
         "best_val_dice_LV": (best_row or {}).get("val_dice_LV", 0.0),
+        "best_val_hd95_fg_mean": finite_or_none((best_row or {}).get("val_hd95_fg_mean")),
+        "best_val_assd_fg_mean": finite_or_none((best_row or {}).get("val_assd_fg_mean")),
+        "best_val_boundary_f1_fg": finite_or_none((best_row or {}).get("val_boundary_f1_fg")),
+        "best_val_surface_dice_fg": finite_or_none((best_row or {}).get("val_surface_dice_fg")),
+        "best_val_hd95_best": None if not math.isfinite(best_hd95) else best_hd95,
+        "best_val_hd95_epoch": best_hd95_epoch,
         "final_val_fg_mean": final_row["val_fg_mean"],
+        "final_val_hd95_fg_mean": finite_or_none(final_row.get("val_hd95_fg_mean")),
+        "final_val_assd_fg_mean": finite_or_none(final_row.get("val_assd_fg_mean")),
+        "final_val_boundary_f1_fg": finite_or_none(final_row.get("val_boundary_f1_fg")),
+        "final_val_surface_dice_fg": finite_or_none(final_row.get("val_surface_dice_fg")),
         "actual_batch_size": int(cfg["actual_batch_size"]),
+        "input_mode": cfg.get("input_mode"),
+        "in_channels": int(cfg.get("in_channels") or 0),
         "image_size": int(cfg["image_size"]),
         "epochs": int(cfg["epochs"]),
         "model_parameter_count": model_params,
@@ -668,6 +787,7 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
         "val_cases": len(split_info["val_cases"]),
         "config_flags": {
             "residual_gate_type": cfg["ssr"].get("residual_gate_type"),
+            "residual_gate_max": cfg["ssr"].get("residual_gate_max"),
             "geometry_refine": cfg["ssr"].get("geometry_refine"),
             "use_bounded_gamma": cfg["ssr"].get("use_bounded_gamma"),
             "gamma_max": cfg["ssr"].get("gamma_max"),
@@ -675,6 +795,7 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
             "suppress_max": cfg["ssr"].get("suppress_max"),
             "hf_ratio_threshold": cfg["ssr"].get("hf_ratio_threshold"),
             "loss_weights": cfg.get("loss_weights", {}),
+            "metrics": cfg.get("metrics", {}),
         },
         "artifacts": [
             "training_log.csv",
@@ -690,6 +811,7 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
             "train_predictions.png",
             "val_predictions.png",
             "best_model.pt",
+            "best_hd95_model.pt",
             "final_model.pt",
             "config_resolved.yaml",
         ],

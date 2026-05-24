@@ -85,8 +85,9 @@ class SEBlock(nn.Module):
 class ResidualChannelGate(nn.Module):
     """Channel gate that inspects identity features and spectral update."""
 
-    def __init__(self, channels: int, reduction: int = 4) -> None:
+    def __init__(self, channels: int, reduction: int = 4, gate_max: float = 1.0) -> None:
         super().__init__()
+        self.gate_max = float(gate_max)
         hidden = max(channels // max(int(reduction), 1), 1)
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.mlp = nn.Sequential(
@@ -97,7 +98,7 @@ class ResidualChannelGate(nn.Module):
         )
 
     def gate(self, x: Tensor, delta: Tensor) -> Tensor:
-        return self.mlp(self.pool(torch.cat([x, delta], dim=1)))
+        return self.gate_max * self.mlp(self.pool(torch.cat([x, delta], dim=1)))
 
     def forward(self, x: Tensor, delta: Tensor) -> Tensor:
         return delta * self.gate(x, delta)
@@ -327,6 +328,7 @@ class SSRBlockV3(nn.Module):
         gamma_max: float = 0.25,
         gamma_init: float = -2.0,
         residual_gate_type: str = "se_update",
+        residual_gate_max: float = 1.0,
         se_reduction: int = 4,
         geometry_refine: str = "none",
         large_kernel_size: int = 7,
@@ -344,6 +346,7 @@ class SSRBlockV3(nn.Module):
         self.use_bounded_gamma = bool(use_bounded_gamma)
         self.gamma_max = float(gamma_max)
         self.residual_gate_type = str(residual_gate_type)
+        self.residual_gate_max = float(residual_gate_max)
         self.geometry_refine_type = str(geometry_refine)
         self.use_hf_ratio_penalty = bool(use_hf_ratio_penalty)
         self.hf_ratio_threshold = float(hf_ratio_threshold)
@@ -389,7 +392,11 @@ class SSRBlockV3(nn.Module):
             self.residual_channel_gate = None
         elif self.residual_gate_type == "residual_channel_gate":
             self.se_update = None
-            self.residual_channel_gate = ResidualChannelGate(channels, reduction=se_reduction)
+            self.residual_channel_gate = ResidualChannelGate(
+                channels,
+                reduction=se_reduction,
+                gate_max=self.residual_gate_max,
+            )
         else:
             raise ValueError(
                 "residual_gate_type must be one of: none, se_update, residual_channel_gate"
