@@ -7,6 +7,9 @@
 - Added `test/run_phase2_variants.sh` to run all Phase Test 2 block-architecture
   ablations sequentially: `baseline_ssr`, `ssr_se`, `ssr_se_bounded`,
   `ssr_se_lk`, `ssr_se_dcn`, and `ssr_full`.
+- Added `test/benchmark_phase2_variants.py` and
+  `test/benchmark_phase2_variants.sh` to rank completed Phase Test 2 baseline
+  runs by validation foreground Dice and export CSV/JSON/Markdown/PNG reports.
 - Added `tests/test_myops_preprocess.py` with synthetic NIfTI checks for paired
   MyoPS modality preprocessing and unknown-label rejection.
 
@@ -45,6 +48,8 @@
   `conda run -n alvin python -B test/train_ssr_acdc.py --config test/configs/ssr_phase2_acdc_224.yaml --variant ssr_se_dcn --epochs 1 --batch_size 2 --image_size 32 --device cpu --num_workers 0 --max_slices 4 --output_root /private/tmp/specumamba_ssr_phase2_smoke --run_name dcnv4_lite_smoke`
 - Verified the new MyoPS preprocessing tests fail on the old single-modality
   behavior and pass after the paired-volume fix.
+- Verified the Phase Test 2 benchmark scripts with compile/shell syntax checks
+  and a local `default` run report generation.
 
 ## 2026-05-23
 

@@ -113,6 +113,27 @@ Optional quick ablation run:
 EPOCHS=20 BATCH_SIZE=4 DEVICE=cuda bash test/run_phase2_variants.sh
 ```
 
+Rank completed ablations:
+
+```bash
+bash test/benchmark_phase2_variants.sh
+```
+
+The benchmark writes:
+
+```bash
+test/outputs/ssr_phase2_acdc_224_benchmark/baseline_benchmark.csv
+test/outputs/ssr_phase2_acdc_224_benchmark/baseline_benchmark.json
+test/outputs/ssr_phase2_acdc_224_benchmark/baseline_benchmark.md
+test/outputs/ssr_phase2_acdc_224_benchmark/baseline_benchmark.png
+```
+
+On a server with a custom output directory:
+
+```bash
+OUTPUT_ROOT=/path/to/test/outputs bash test/benchmark_phase2_variants.sh
+```
+
 Analyze:
 
 ```bash
