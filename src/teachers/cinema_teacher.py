@@ -82,6 +82,7 @@ class CineMATeacher(FrozenSegmentationTeacher):
         try:
             self.model = _load_local_convunetr(self.checkpoint_path, self.config_path)
             self.loaded = True
+            disabled_ckpt = _disable_gradient_checkpointing(self.model)
             self.freeze_model()
             self.meta = {
                 "checkpoint_path": str(self.checkpoint_path),
@@ -90,6 +91,7 @@ class CineMATeacher(FrozenSegmentationTeacher):
                 "view": self.view,
                 "seed": self.seed,
                 "backend": "local_safetensors",
+                "disabled_gradient_checkpointing_modules": disabled_ckpt,
             }
             return self
         except Exception as exc:  # pragma: no cover - depends on external repo
@@ -115,6 +117,7 @@ class CineMATeacher(FrozenSegmentationTeacher):
             try:
                 self.model = ConvUNetR.from_finetuned(**clean_kwargs)
                 self.loaded = True
+                disabled_ckpt = _disable_gradient_checkpointing(self.model)
                 self.freeze_model()
                 self.meta = {
                     "checkpoint_path": str(self.checkpoint_path),
@@ -124,6 +127,7 @@ class CineMATeacher(FrozenSegmentationTeacher):
                     "seed": self.seed,
                     "backend": "from_finetuned",
                     "from_finetuned_kwargs": clean_kwargs,
+                    "disabled_gradient_checkpointing_modules": disabled_ckpt,
                 }
                 break
             except Exception as exc:  # pragma: no cover - depends on external repo
@@ -188,6 +192,7 @@ class CineMATeacher(FrozenSegmentationTeacher):
             center = sax.shape[-1] // 2
             start = max(center - target_d // 2, 0)
             sax = sax[..., start : start + target_d]
+        sax = sax.contiguous()
         model_batch = {self.view: sax}
         raw = self.model(model_batch)
         if isinstance(raw, dict):
@@ -312,3 +317,16 @@ def _read_inference_spatial_size(config_path: Path) -> tuple[int, int, int]:
     except Exception:
         pass
     return (192, 192, 16)
+
+
+def _disable_gradient_checkpointing(model: torch.nn.Module) -> int:
+    """Disable gradient checkpointing flags in a frozen teacher."""
+    count = 0
+    for module in model.modules():
+        for attr in ("grad_ckpt", "gradient_checkpointing", "use_checkpoint", "use_checkpointing"):
+            if hasattr(module, attr):
+                value = getattr(module, attr)
+                if isinstance(value, bool) and value:
+                    setattr(module, attr, False)
+                    count += 1
+    return count

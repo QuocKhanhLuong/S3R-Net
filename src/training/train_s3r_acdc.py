@@ -588,7 +588,8 @@ def format_teacher_kd_startup_log(kd: dict[str, Any], context: dict[str, Any], c
     lines = [
         "Dual-teacher KD enabled:",
         f"  source={'cache:'+str(cache_dir) if cache_dir else 'online teachers'}",
-        f"  teacher_stub={bool(kd.get('teacher_stub', False))} teacher_device={context.get('teacher_device')}",
+        f"  teacher_stub={bool(kd.get('teacher_stub', False))} teacher_device={context.get('teacher_device')} "
+        f"teacher_amp={bool(kd.get('teacher_amp', False))}",
         f"  T={kd.get('kd_temperature')} lambda_field={kd.get('lambda_field')} "
         f"lambda_cine_boundary={kd.get('lambda_cine_boundary')} lambda_fuse={kd.get('lambda_fuse')} "
         f"lambda_spec={kd.get('lambda_spec')}",
@@ -599,11 +600,14 @@ def format_teacher_kd_startup_log(kd: dict[str, Any], context: dict[str, Any], c
         f"  Medical-SAM3={'enabled' if medical is not None else 'not required'}",
     ]
     if cinema is not None:
+        cinema_meta = getattr(cinema, "meta", {}) or {}
         lines.append(
             "  CineMA="
             f"checkpoint:{getattr(cinema, 'checkpoint_path', None)} "
             f"config:{getattr(cinema, 'config_path', None)} "
-            f"view:{getattr(cinema, 'view', None)}"
+            f"view:{getattr(cinema, 'view', None)} "
+            f"backend:{cinema_meta.get('backend', 'unknown')} "
+            f"grad_ckpt_disabled:{cinema_meta.get('disabled_gradient_checkpointing_modules', 0)}"
         )
     return "\n".join(lines)
 
