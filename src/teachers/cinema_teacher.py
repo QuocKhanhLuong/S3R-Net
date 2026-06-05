@@ -44,6 +44,7 @@ class CineMATeacher(FrozenSegmentationTeacher):
         self.seed = int(seed)
         self.class_map = parse_class_map(class_map)
         self.model = None
+        self.inference_spatial_size = (192, 192, 16)
 
     def load(self) -> "CineMATeacher":
         if self.teacher_stub:
@@ -65,6 +66,7 @@ class CineMATeacher(FrozenSegmentationTeacher):
                 f"No CineMA config.yaml found near checkpoint {ckpt}. "
                 "Expected finetuned/segmentation/acdc_sax/config.yaml or pass --cinema_config."
             )
+        self.inference_spatial_size = _read_inference_spatial_size(self.config_path)
         sys.path.insert(0, str(self.repo_path.resolve()))
         try:
             cinema_module = importlib.import_module("cinema")
@@ -173,12 +175,19 @@ class CineMATeacher(FrozenSegmentationTeacher):
         image = batch["image"].to(self.device).float()
         original_hw = tuple(image.shape[-2:])
         image = _minmax_scale(image)
+        target_h, target_w, target_d = self.inference_spatial_size
+        if tuple(image.shape[-2:]) != (target_h, target_w):
+            image = F.interpolate(image, size=(target_h, target_w), mode="bilinear", align_corners=False)
         if image.shape[1] > 1:
             sax = image.unsqueeze(1).permute(0, 1, 3, 4, 2).contiguous()  # [B,1,H,W,C]
         else:
             sax = image.unsqueeze(-1)  # [B,1,H,W,1]
-        if sax.shape[-1] < 16:
-            sax = F.pad(sax, (0, 16 - sax.shape[-1]))
+        if sax.shape[-1] < target_d:
+            sax = F.pad(sax, (0, target_d - sax.shape[-1]))
+        elif sax.shape[-1] > target_d:
+            center = sax.shape[-1] // 2
+            start = max(center - target_d // 2, 0)
+            sax = sax[..., start : start + target_d]
         model_batch = {self.view: sax}
         raw = self.model(model_batch)
         if isinstance(raw, dict):
@@ -286,3 +295,20 @@ def _load_local_convunetr(checkpoint_path: Path, config_path: Path) -> torch.nn.
             state_dict[key] = f.get_tensor(key)
     model.load_state_dict(state_dict, strict=False)
     return model
+
+
+def _read_inference_spatial_size(config_path: Path) -> tuple[int, int, int]:
+    """Read CineMA patch/input size from config, fallback to ACDC SAX default."""
+    try:
+        import yaml
+
+        with open(config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        patch_size = cfg.get("patch_size") or cfg.get("data", {}).get("patch_size")
+        if patch_size is None:
+            patch_size = cfg.get("segmentation", {}).get("patch_size")
+        if isinstance(patch_size, (list, tuple)) and len(patch_size) >= 3:
+            return (int(patch_size[0]), int(patch_size[1]), int(patch_size[2]))
+    except Exception:
+        pass
+    return (192, 192, 16)
