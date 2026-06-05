@@ -3,6 +3,26 @@
 This folder contains isolated Selective Spectral Retention experiments. It does
 not modify the main SpecMamba training pipeline, models, or paper-facing code.
 
+Status: these files are now prototypes/backups. The promoted S3R implementation
+lives under:
+
+```bash
+src/models/s3r
+```
+
+Future supervised ACDC training should use:
+
+```bash
+python src/training/train_s3r_acdc.py --model s3r_mini
+```
+
+Future distillation experiments should use:
+
+```bash
+python src/distillation/train_s3r_distill.py \
+  --config src/distillation/configs/s3r_scsd_phase3_dual_routing.yaml
+```
+
 The experiment uses the existing preprocessed ACDC data under:
 
 ```bash

@@ -1,0 +1,35 @@
+phase: phase1_semantic
+data_root: preprocessed_data/ACDC
+output_root: weights/s3r_distill
+model: s3r_mini
+image_size: 224
+input_mode: 2d
+in_channels: 1
+epochs: 200
+batch_size: 8
+num_workers: 4
+seed: 42
+device: cuda
+missing_cache_policy: raise
+
+loss_weights:
+  supervised: 1.0
+  semantic_kd: 0.3
+  characteristic_kd: 0.0
+  boundary_kd: 0.0
+  distance_kd: 0.0
+  spectral_boundary_kd: 0.0
+  state_kd: 0.0
+  agreement_weighting: false
+  region_routing: false
+
+teacher_cache_dir: null
+semantic_teacher:
+  enabled: false
+  type: cache
+  checkpoint: null
+
+characteristic_teacher:
+  enabled: false
+  type: cache
+  checkpoint: null

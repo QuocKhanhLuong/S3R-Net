@@ -79,8 +79,16 @@ def build_arg_parser(config_defaults=None):
     parser.add_argument('--num_workers', type=int, default=4)
 
     parser.add_argument('--model', type=str, default='asym_spec_mamba',
-                        choices=['specmamba', 'asym_spec_mamba', 'hrnet_dcn', 'hrnet_resnet34'])
+                        choices=['specmamba', 'asym_spec_mamba', 'hrnet_dcn', 'hrnet_resnet34',
+                                 's3r', 's3r_mini', 's3r_net'])
     parser.add_argument('--base_channels', type=int, default=48)
+    parser.add_argument('--in_channels', type=int, default=None)
+    parser.add_argument('--input_mode', type=str, default='2d', choices=['2d', '25d'])
+    parser.add_argument('--num_bands', type=int, default=4)
+    parser.add_argument('--return_logs', action='store_true')
+    parser.add_argument('--boundary_freq_weight', type=float, default=0.20)
+    parser.add_argument('--hf_ratio_weight', type=float, default=0.005)
+    parser.add_argument('--gate_reg_weight', type=float, default=0.03)
     parser.add_argument('--use_pointrend', action='store_true')
     parser.add_argument('--use_shearlet', action='store_true')
     parser.add_argument('--no_full_res', action='store_true')
@@ -671,7 +679,15 @@ def main():
 
     num_classes = 4
     is_hybrid = (args.model == 'asym_spec_mamba')
-    in_channels = 5 if is_hybrid else 3
+    is_s3r = args.model in {'s3r', 's3r_mini', 's3r_net'}
+    if args.in_channels is not None:
+        in_channels = args.in_channels
+    elif is_hybrid or (is_s3r and args.input_mode == '25d'):
+        in_channels = 5
+    elif is_s3r:
+        in_channels = 1
+    else:
+        in_channels = 3
 
     # ── Model ───────────────────────────────────────────────────────────
     if args.model == 'asym_spec_mamba':
@@ -710,6 +726,16 @@ def main():
             full_resolution_mode=not args.no_full_res,
         ).to(device)
         model_name = f"HRNetResNet34-C{args.base_channels}"
+    elif is_s3r:
+        from models.s3r import build_s3r_model
+        model = build_s3r_model(
+            model=args.model,
+            in_channels=in_channels,
+            num_classes=num_classes,
+            base_channels=args.base_channels,
+            num_bands=args.num_bands,
+        ).to(device)
+        model_name = f"S3R-{args.model}-C{args.base_channels}"
 
     params = sum(p.numel() for p in model.parameters())
 
@@ -741,7 +767,7 @@ def main():
             print(f"HD95 Unit:  pixel (no spacing)")
 
     # ── Data ────────────────────────────────────────────────────────────
-    if is_hybrid:
+    if is_hybrid or (is_s3r and args.input_mode == '25d'):
         base_dataset = ACDCDataset25D(args.data_dir, augment=False)
         aug_dataset = ACDCDataset25D(args.data_dir, augment=True) if args.augment else None
     else:
@@ -772,7 +798,7 @@ def main():
         f"Val={len(split_manifest['splits']['val']['patients'])}"
     )
 
-    if is_hybrid and aug_dataset:
+    if (is_hybrid or (is_s3r and args.input_mode == '25d')) and aug_dataset:
         train_ds = Subset(aug_dataset, train_idx)
         print(f"Augmentation: ON (2.5D flip+rot)")
     elif not is_hybrid and args.augment:
