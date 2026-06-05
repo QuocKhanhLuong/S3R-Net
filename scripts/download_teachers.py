@@ -30,7 +30,7 @@ def main() -> None:
     except ImportError as exc:
         raise SystemExit("huggingface_hub is required. Install with: pip install -U huggingface_hub safetensors") from exc
 
-    output_dir = Path(args.output_dir)
+    output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     downloads = []
     if args.teacher in {"medical_sam3", "both"}:
@@ -54,11 +54,7 @@ def main() -> None:
             print("If the repository is gated/private, run: huggingface-cli login")
             raise SystemExit(1) from exc
 
-        candidates = sorted(
-            str(p.relative_to(local_dir))
-            for p in Path(path).rglob("*")
-            if p.is_file() and p.suffix.lower() in CHECKPOINT_EXTENSIONS
-        )
+        candidates = checkpoint_candidates(Path(path), local_dir)
         manifest["teachers"][name] = {
             "source_repo": repo_id,
             "local_path": str(local_dir),
@@ -75,6 +71,22 @@ def main() -> None:
         json.dump(manifest, f, indent=2)
         f.write("\n")
     print(f"Wrote manifest: {manifest_path}")
+
+
+def checkpoint_candidates(download_path: Path, local_dir: Path) -> list[str]:
+    """List checkpoint candidates relative to the local teacher directory."""
+    root = download_path.expanduser().resolve()
+    base = local_dir.expanduser().resolve()
+    candidates = []
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in CHECKPOINT_EXTENSIONS:
+            continue
+        resolved = path.resolve()
+        try:
+            candidates.append(str(resolved.relative_to(base)))
+        except ValueError:
+            candidates.append(str(resolved))
+    return sorted(candidates)
 
 
 if __name__ == "__main__":
