@@ -117,3 +117,10 @@ python src/training/train_s3r_acdc.py \
   --max_slices 32 \
   --save_dir weights/smoke_s3r_mini
 ```
+
+Optional reporting flags:
+
+```bash
+--no_tqdm
+--wandb --wandb_project s3r-acdc --wandb_run_name my_run
+```

@@ -18,6 +18,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = ROOT / "src"
@@ -35,7 +36,18 @@ from distillation.distill_losses import S3RSCSDLoss
 from distillation.teacher_cache import load_teacher_cache
 from models.s3r import S3RLoss, build_s3r_model
 from models.s3r.losses import boundary_map_from_mask
-from training.train_s3r_acdc import save_prediction_grid
+from models.s3r.metrics import segmentation_surface_metrics
+from training.train_s3r_acdc import (
+    append_classification_metrics,
+    finish_wandb,
+    format_class_metric_table,
+    init_wandb,
+    log_wandb_metrics,
+    nanmean_or_nan,
+    save_prediction_grid,
+    should_compute_surface_metrics,
+    surface_metric_keys,
+)
 
 
 CLASS_NAMES = ["BG", "RV", "MYO", "LV"]
@@ -60,6 +72,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_root", default=None)
     parser.add_argument("--output_root", default=None)
     parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument("--no_tqdm", action="store_true", default=None)
+    parser.add_argument("--wandb", action="store_true", default=None)
+    parser.add_argument("--wandb_project", default=None)
+    parser.add_argument("--wandb_entity", default=None)
+    parser.add_argument("--wandb_run_name", default=None)
+    parser.add_argument("--wandb_mode", default=None)
     return parser.parse_args()
 
 
@@ -97,6 +115,22 @@ def apply_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
     cfg["loss_weights"].setdefault("supervised", 1.0)
     cfg.setdefault("s3r_loss_weights", {})
     cfg.setdefault("ssr", {})
+    cfg.setdefault("use_tqdm", True)
+
+    metrics = cfg.setdefault("metrics", {})
+    metrics.setdefault("surface_tolerance", 2)
+    metrics.setdefault("compute_hd95", True)
+    metrics.setdefault("compute_assd", True)
+    metrics.setdefault("compute_boundary_f1", False)
+    metrics.setdefault("compute_surface_dice", False)
+    metrics.setdefault("full_every_n_epochs", 1)
+
+    wandb_cfg = cfg.setdefault("wandb", {})
+    wandb_cfg.setdefault("enabled", False)
+    wandb_cfg.setdefault("project", "s3r-scsd")
+    wandb_cfg.setdefault("entity", None)
+    wandb_cfg.setdefault("run_name", None)
+    wandb_cfg.setdefault("mode", "online")
     return cfg
 
 
@@ -126,6 +160,19 @@ def apply_cli(cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
         cfg.setdefault("characteristic_teacher", {})["checkpoint"] = args.characteristic_teacher_checkpoint
     if args.input_mode is not None and args.in_channels is None:
         cfg["in_channels"] = 5 if args.input_mode == "25d" else 1
+    if args.no_tqdm:
+        cfg["use_tqdm"] = False
+    if args.wandb:
+        cfg.setdefault("wandb", {})["enabled"] = True
+    for arg_key, cfg_key in (
+        ("wandb_project", "project"),
+        ("wandb_entity", "entity"),
+        ("wandb_run_name", "run_name"),
+        ("wandb_mode", "mode"),
+    ):
+        value = getattr(args, arg_key)
+        if value is not None:
+            cfg.setdefault("wandb", {})[cfg_key] = value
     return apply_defaults(cfg)
 
 
@@ -250,12 +297,21 @@ def run_epoch(
     totals: dict[str, float] = {}
     distill_rows: list[dict[str, Any]] = []
     num_classes = int(cfg["num_classes"])
-    inter = torch.zeros(num_classes, device=device)
-    denom = torch.zeros(num_classes, device=device)
+    tp = torch.zeros(num_classes, device=device)
+    fp = torch.zeros(num_classes, device=device)
+    fn = torch.zeros(num_classes, device=device)
+    surface_values: dict[str, list[float]] = {key: [] for key in surface_metric_keys()}
+    compute_surface = (not training) and should_compute_surface_metrics(cfg, epoch)
 
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
-        for batch_idx, batch in enumerate(loader):
+        progress = tqdm(
+            loader,
+            desc=f"{split} e{epoch:03d}",
+            leave=False,
+            disable=not bool(cfg.get("use_tqdm", True)),
+        )
+        for batch_idx, batch in enumerate(progress):
             images = batch["image"].to(device, non_blocking=True)
             masks = batch["mask"].to(device, non_blocking=True)
             boundary_target = boundary_map_from_mask(masks).to(device)
@@ -283,6 +339,7 @@ def run_epoch(
                 if grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
+            progress.set_postfix(loss=f"{float(loss.detach().cpu()):.4f}")
 
             batch_size = int(images.shape[0])
             total_samples += batch_size
@@ -296,15 +353,26 @@ def run_epoch(
             for cls in range(num_classes):
                 pred_c = preds == cls
                 target_c = masks == cls
-                inter[cls] += (pred_c & target_c).sum()
-                denom[cls] += pred_c.sum() + target_c.sum()
+                tp[cls] += (pred_c & target_c).sum()
+                fp[cls] += (pred_c & ~target_c).sum()
+                fn[cls] += (~pred_c & target_c).sum()
+
+            if compute_surface:
+                batch_surface = segmentation_surface_metrics(
+                    preds.detach().cpu().numpy(),
+                    masks.detach().cpu().numpy(),
+                    num_classes=num_classes,
+                    tolerance=float(cfg.get("metrics", {}).get("surface_tolerance", 2)),
+                    spacing=None,
+                )
+                for key, value in batch_surface.items():
+                    if key in surface_values and value is not None:
+                        surface_values[key].append(float(value))
 
     metrics = {key: value / max(total_samples, 1) for key, value in totals.items()}
-    dice = (2.0 * inter + 1e-6) / (denom + 1e-6)
-    for cls, name in enumerate(CLASS_NAMES[:num_classes]):
-        metrics[f"dice_{name}"] = float(dice[cls].detach().cpu())
-    fg = [metrics[f"dice_{name}"] for name in CLASS_NAMES[1:num_classes]]
-    metrics["fg_dice"] = float(np.mean(fg)) if fg else metrics.get("dice_BG", math.nan)
+    append_classification_metrics(metrics, tp, fp, fn, CLASS_NAMES[:num_classes])
+    for key, vals in surface_values.items():
+        metrics[key] = nanmean_or_nan(vals)
     return metrics, distill_rows
 
 
@@ -330,6 +398,20 @@ def is_cuda_oom(exc: RuntimeError) -> bool:
     return "out of memory" in text or "cuda oom" in text
 
 
+def print_distill_epoch_report(epoch: int, train_metrics: dict[str, float], val_metrics: dict[str, float]) -> None:
+    print(
+        f"epoch {epoch:03d} "
+        f"train_loss={train_metrics.get('total_loss', math.nan):.4f} "
+        f"val_loss={val_metrics.get('total_loss', math.nan):.4f} "
+        f"train_fg={train_metrics.get('fg_dice', math.nan):.4f} "
+        f"val_fg={val_metrics.get('fg_dice', math.nan):.4f} "
+        f"sem_kd={train_metrics.get('semantic_kd', 0.0):.4f} "
+        f"bnd_kd={train_metrics.get('boundary_kd', 0.0):.4f} "
+        f"state_kd={train_metrics.get('state_kd', 0.0):.4f}"
+    )
+    print(format_class_metric_table(val_metrics))
+
+
 def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
     seed_everything(int(cfg["seed"]))
     device = resolve_device(str(cfg["device"]))
@@ -344,6 +426,7 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
     train_loader, val_loader, split_info = make_loaders(cfg)
     model = build_model(cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["lr"]), weight_decay=float(cfg["weight_decay"]))
+    wandb_run = init_wandb(cfg, run_dir)
     supervised_loss = build_supervised_loss(cfg)
     distill_loss = S3RSCSDLoss(
         num_classes=int(cfg["num_classes"]),
@@ -376,7 +459,16 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
             "distance_kd": train_metrics.get("distance_kd", 0.0),
             "spectral_boundary_kd": train_metrics.get("spectral_boundary_kd", 0.0),
             "state_kd": train_metrics.get("state_kd", 0.0),
+            "val_hd95_fg_mean": val_metrics.get("hd95_fg_mean", math.nan),
+            "val_assd_fg_mean": val_metrics.get("assd_fg_mean", math.nan),
         }
+        for name in CLASS_NAMES[: int(cfg["num_classes"])]:
+            lower = name.lower()
+            for metric_name in ("dice", "precision", "recall"):
+                row[f"train_{metric_name}_{name}"] = train_metrics.get(f"{metric_name}_{name}", math.nan)
+                row[f"val_{metric_name}_{name}"] = val_metrics.get(f"{metric_name}_{name}", math.nan)
+            row[f"val_hd95_{lower}"] = val_metrics.get(f"hd95_{lower}", math.nan)
+            row[f"val_assd_{lower}"] = val_metrics.get(f"assd_{lower}", math.nan)
         training_rows.append(row)
         if val_metrics["fg_dice"] > best_val:
             best_val = val_metrics["fg_dice"]
@@ -385,11 +477,8 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
         write_csv(run_dir / "training_log.csv", training_rows)
         write_csv(run_dir / "distill_log.csv", distill_rows)
         write_empty_s3r_log(run_dir / "s3r_logs.csv")
-        print(
-            f"epoch {epoch:03d} train_loss={row['train_loss']:.4f} val_loss={row['val_loss']:.4f} "
-            f"train_fg={row['train_fg_mean']:.4f} val_fg={row['val_fg_mean']:.4f} "
-            f"sem_kd={row['semantic_kd']:.4f} bnd_kd={row['boundary_kd']:.4f} state_kd={row['state_kd']:.4f}"
-        )
+        print_distill_epoch_report(epoch, train_metrics, val_metrics)
+        log_wandb_metrics(wandb_run, epoch, train_metrics, val_metrics, {"lr": optimizer.param_groups[0]["lr"]})
 
     torch.save({"epoch": int(cfg["epochs"]), "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(), "config": cfg}, run_dir / "final_model.pt")
     save_prediction_grid(model, train_loader, device, run_dir / "train_predictions.png")
@@ -418,6 +507,7 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
     with open(run_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
         f.write("\n")
+    finish_wandb(wandb_run)
     return summary
 
 

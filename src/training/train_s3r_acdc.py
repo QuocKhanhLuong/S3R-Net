@@ -19,6 +19,7 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = ROOT / "src"
@@ -68,6 +69,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_root", default=None)
     parser.add_argument("--save_dir", default=None)
     parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument("--no_tqdm", action="store_true", default=None)
+    parser.add_argument("--wandb", action="store_true", default=None)
+    parser.add_argument("--wandb_project", default=None)
+    parser.add_argument("--wandb_entity", default=None)
+    parser.add_argument("--wandb_run_name", default=None)
+    parser.add_argument("--wandb_mode", default=None)
     return parser.parse_args()
 
 
@@ -111,6 +118,14 @@ def apply_config_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
     cfg.setdefault("device", "cuda")
     cfg.setdefault("split_manifest", "splits/acdc_patient_split_seed42.json")
     cfg.setdefault("variant", "default")
+    cfg.setdefault("use_tqdm", True)
+
+    wandb_cfg = cfg.setdefault("wandb", {})
+    wandb_cfg.setdefault("enabled", False)
+    wandb_cfg.setdefault("project", "s3r-acdc")
+    wandb_cfg.setdefault("entity", None)
+    wandb_cfg.setdefault("run_name", None)
+    wandb_cfg.setdefault("mode", "online")
 
     loss_weights = cfg.setdefault("loss_weights", {})
     loss_weights.setdefault("boundary_bce", 0.50)
@@ -198,6 +213,19 @@ def apply_variant_and_cli(cfg: dict[str, Any], args: argparse.Namespace) -> dict
         cfg["return_logs"] = bool(args.return_logs)
     if args.use_s3r_state is not None:
         cfg["use_s3r_state"] = bool(args.use_s3r_state)
+    if args.no_tqdm:
+        cfg["use_tqdm"] = False
+    if args.wandb:
+        cfg.setdefault("wandb", {})["enabled"] = True
+    for arg_key, cfg_key in (
+        ("wandb_project", "project"),
+        ("wandb_entity", "entity"),
+        ("wandb_run_name", "run_name"),
+        ("wandb_mode", "mode"),
+    ):
+        value = getattr(args, arg_key)
+        if value is not None:
+            cfg.setdefault("wandb", {})[cfg_key] = value
     if args.input_mode is not None and args.in_channels is None:
         cfg["in_channels"] = 5 if str(args.input_mode).lower() == "25d" else 1
     return apply_config_defaults(cfg)
@@ -370,6 +398,123 @@ def compute_loss(
     }
 
 
+def append_classification_metrics(
+    metrics: dict[str, float],
+    tp: Tensor,
+    fp: Tensor,
+    fn: Tensor,
+    class_names: list[str],
+) -> None:
+    """Add Dice, Precision, and Recall per class from confusion counts."""
+    tp_d = tp.detach().double().cpu()
+    fp_d = fp.detach().double().cpu()
+    fn_d = fn.detach().double().cpu()
+    for cls, name in enumerate(class_names):
+        dice_den = (2.0 * tp_d[cls] + fp_d[cls] + fn_d[cls]).item()
+        precision_den = (tp_d[cls] + fp_d[cls]).item()
+        recall_den = (tp_d[cls] + fn_d[cls]).item()
+        metrics[f"dice_{name}"] = 1.0 if dice_den == 0.0 else float((2.0 * tp_d[cls]).item() / dice_den)
+        metrics[f"precision_{name}"] = 1.0 if precision_den == 0.0 else float(tp_d[cls].item() / precision_den)
+        metrics[f"recall_{name}"] = 1.0 if recall_den == 0.0 else float(tp_d[cls].item() / recall_den)
+
+    foreground = [metrics[f"dice_{name}"] for name in class_names[1:] if f"dice_{name}" in metrics]
+    metrics["fg_dice"] = float(np.mean(foreground)) if foreground else metrics.get("dice_BG", math.nan)
+
+
+def format_metric(value: Any, digits: int = 4) -> str:
+    try:
+        scalar = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if not math.isfinite(scalar):
+        return "-"
+    return f"{scalar:.{digits}f}"
+
+
+def format_class_metric_table(metrics: dict[str, float], class_names: list[str] | None = None) -> str:
+    """Format the compact validation class table printed each epoch."""
+    class_names = class_names or CLASS_NAMES[1:]
+    rows = [("Class", "Dice", "HD95", "Precision", "Recall", "ASSD")]
+    for name in class_names:
+        lower = name.lower()
+        rows.append(
+            (
+                name,
+                format_metric(metrics.get(f"dice_{name}")),
+                format_metric(metrics.get(f"hd95_{lower}")),
+                format_metric(metrics.get(f"precision_{name}")),
+                format_metric(metrics.get(f"recall_{name}")),
+                format_metric(metrics.get(f"assd_{lower}")),
+            )
+        )
+    widths = [max(len(row[idx]) for row in rows) for idx in range(len(rows[0]))]
+    lines = []
+    for idx, row in enumerate(rows):
+        line = "  ".join(cell.rjust(widths[col]) for col, cell in enumerate(row))
+        lines.append(line)
+        if idx == 0:
+            lines.append("  ".join("-" * width for width in widths))
+    return "\n".join(lines)
+
+
+def print_epoch_report(epoch: int, train_metrics: dict[str, float], val_metrics: dict[str, float]) -> None:
+    print(
+        f"epoch {epoch:03d} "
+        f"train_loss={train_metrics.get('loss', math.nan):.4f} "
+        f"val_loss={val_metrics.get('loss', math.nan):.4f} "
+        f"train_fg={train_metrics.get('fg_dice', math.nan):.4f} "
+        f"val_fg={val_metrics.get('fg_dice', math.nan):.4f}"
+    )
+    print(format_class_metric_table(val_metrics))
+
+
+def init_wandb(cfg: dict[str, Any], run_dir: Path) -> Any:
+    wandb_cfg = cfg.get("wandb", {})
+    if not bool(wandb_cfg.get("enabled", False)):
+        return None
+    try:
+        import wandb
+    except ImportError:
+        print("wandb was requested but is not installed; continuing without wandb logging.")
+        return None
+    return wandb.init(
+        project=wandb_cfg.get("project") or "s3r-acdc",
+        entity=wandb_cfg.get("entity"),
+        name=wandb_cfg.get("run_name") or cfg.get("run_name"),
+        mode=wandb_cfg.get("mode") or "online",
+        dir=str(run_dir),
+        config=cfg,
+    )
+
+
+def flatten_metrics_for_wandb(prefix: str, metrics: dict[str, Any]) -> dict[str, float]:
+    flat: dict[str, float] = {}
+    for key, value in metrics.items():
+        try:
+            scalar = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(scalar):
+            flat[f"{prefix}/{key}"] = scalar
+    return flat
+
+
+def log_wandb_metrics(run: Any, epoch: int, train_metrics: dict[str, Any], val_metrics: dict[str, Any], extra: dict[str, Any] | None = None) -> None:
+    if run is None:
+        return
+    payload: dict[str, Any] = {"epoch": epoch}
+    payload.update(flatten_metrics_for_wandb("train", train_metrics))
+    payload.update(flatten_metrics_for_wandb("val", val_metrics))
+    if extra:
+        payload.update({key: value for key, value in extra.items() if isinstance(value, (int, float)) and math.isfinite(float(value))})
+    run.log(payload, step=epoch)
+
+
+def finish_wandb(run: Any) -> None:
+    if run is not None:
+        run.finish()
+
+
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -385,8 +530,9 @@ def run_epoch(
     num_classes = int(cfg["num_classes"])
     totals: dict[str, float] = {}
     total_samples = 0
-    inter = torch.zeros(num_classes, device=device)
-    denom = torch.zeros(num_classes, device=device)
+    tp = torch.zeros(num_classes, device=device)
+    fp = torch.zeros(num_classes, device=device)
+    fn = torch.zeros(num_classes, device=device)
     ssr_rows: list[dict[str, Any]] = []
     detailed_logs: dict[str, Any] | None = None
     surface_values: dict[str, list[float]] = {key: [] for key in surface_metric_keys()}
@@ -394,7 +540,13 @@ def run_epoch(
 
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
-        for batch_idx, batch in enumerate(loader):
+        progress = tqdm(
+            loader,
+            desc=f"{split} e{epoch:03d}",
+            leave=False,
+            disable=not bool(cfg.get("use_tqdm", True)),
+        )
+        for batch_idx, batch in enumerate(progress):
             images = batch["image"].to(device, non_blocking=True)
             masks = batch["mask"].to(device, non_blocking=True)
             boundary_target = boundary_map_from_mask(masks).to(device)
@@ -410,6 +562,7 @@ def run_epoch(
                 if grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
+            progress.set_postfix(loss=f"{parts['loss']:.4f}")
 
             batch_size = int(images.shape[0])
             total_samples += batch_size
@@ -420,8 +573,9 @@ def run_epoch(
             for cls in range(num_classes):
                 pred_c = preds == cls
                 target_c = masks == cls
-                inter[cls] += (pred_c & target_c).sum()
-                denom[cls] += pred_c.sum() + target_c.sum()
+                tp[cls] += (pred_c & target_c).sum()
+                fp[cls] += (pred_c & ~target_c).sum()
+                fn[cls] += (~pred_c & target_c).sum()
 
             if compute_surface:
                 batch_surface = segmentation_surface_metrics(
@@ -439,12 +593,8 @@ def run_epoch(
                 detailed_logs = outputs.get("logs")
                 ssr_rows.extend(flatten_ssr_logs(epoch, split, detailed_logs))
 
-    dice = (2.0 * inter + 1e-6) / (denom + 1e-6)
     metrics = {key: value / max(total_samples, 1) for key, value in totals.items()}
-    for cls, name in enumerate(CLASS_NAMES[:num_classes]):
-        metrics[f"dice_{name}"] = float(dice[cls].detach().cpu())
-    fg_keys = [f"dice_{name}" for name in CLASS_NAMES[1:num_classes]]
-    metrics["fg_dice"] = float(np.mean([metrics[k] for k in fg_keys])) if fg_keys else metrics["dice_BG"]
+    append_classification_metrics(metrics, tp, fp, fn, CLASS_NAMES[:num_classes])
     for key, vals in surface_values.items():
         metrics[key] = nanmean_or_nan(vals)
     return metrics, ssr_rows, detailed_logs
@@ -714,6 +864,7 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
     model = build_model(cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["lr"]), weight_decay=float(cfg["weight_decay"]))
     model_params = count_parameters(model)
+    wandb_run = init_wandb(cfg, run_dir)
 
     with open(run_dir / "config_resolved.yaml", "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
@@ -733,7 +884,9 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
     )
 
     for epoch in range(1, int(cfg["epochs"]) + 1):
-        log_ssr = epoch == 1 or epoch % 5 == 0 or epoch == int(cfg["epochs"])
+        log_ssr = bool(cfg.get("return_logs", False)) and (
+            epoch == 1 or epoch % 5 == 0 or epoch == int(cfg["epochs"])
+        )
         train_metrics, train_ssr_rows, train_logs = run_epoch(model, train_loader, optimizer, device, cfg, epoch, "train", log_ssr)
         val_metrics, val_ssr_rows, val_logs = run_epoch(model, val_loader, None, device, cfg, epoch, "val", log_ssr)
         ssr_rows.extend(train_ssr_rows)
@@ -748,10 +901,6 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
             "val_fg_mean": val_metrics["fg_dice"],
             "train_fg_dice": train_metrics["fg_dice"],
             "val_fg_dice": val_metrics["fg_dice"],
-            "val_dice_BG": val_metrics.get("dice_BG", 0.0),
-            "val_dice_RV": val_metrics.get("dice_RV", 0.0),
-            "val_dice_MYO": val_metrics.get("dice_MYO", 0.0),
-            "val_dice_LV": val_metrics.get("dice_LV", 0.0),
             "train_boundary_bce": train_metrics["boundary_bce"],
             "train_boundary_dice": train_metrics["boundary_dice"],
             "train_bfreq": train_metrics["boundary_frequency"],
@@ -764,17 +913,18 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
             "val_tv": val_metrics["tv"],
             "val_gate_reg": val_metrics["gate_reg"],
             "val_hf_ratio_penalty": val_metrics["hf_ratio_penalty"],
-            "val_hd95_rv": val_metrics.get("hd95_rv", math.nan),
-            "val_hd95_myo": val_metrics.get("hd95_myo", math.nan),
-            "val_hd95_lv": val_metrics.get("hd95_lv", math.nan),
             "val_hd95_fg_mean": val_metrics.get("hd95_fg_mean", math.nan),
-            "val_assd_rv": val_metrics.get("assd_rv", math.nan),
-            "val_assd_myo": val_metrics.get("assd_myo", math.nan),
-            "val_assd_lv": val_metrics.get("assd_lv", math.nan),
             "val_assd_fg_mean": val_metrics.get("assd_fg_mean", math.nan),
             "val_boundary_f1_fg": val_metrics.get("boundary_f1_fg", math.nan),
             "val_surface_dice_fg": val_metrics.get("surface_dice_fg", math.nan),
         }
+        for name in CLASS_NAMES[: int(cfg["num_classes"])]:
+            lower = name.lower()
+            for metric_name in ("dice", "precision", "recall"):
+                row[f"train_{metric_name}_{name}"] = train_metrics.get(f"{metric_name}_{name}", math.nan)
+                row[f"val_{metric_name}_{name}"] = val_metrics.get(f"{metric_name}_{name}", math.nan)
+            row[f"val_hd95_{lower}"] = val_metrics.get(f"hd95_{lower}", math.nan)
+            row[f"val_assd_{lower}"] = val_metrics.get(f"assd_{lower}", math.nan)
         training_rows.append(row)
 
         if val_metrics["fg_dice"] > best_val:
@@ -791,18 +941,8 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
         write_csv(run_dir / "training_log.csv", training_rows)
         write_csv(run_dir / "ssr_logs.csv", ssr_rows, ["epoch", "split", "block", "metric", "band", "value"])
 
-        print(
-            f"epoch {epoch:03d} "
-            f"train_loss={train_metrics['loss']:.4f} val_loss={val_metrics['loss']:.4f} "
-            f"train_fg={train_metrics['fg_dice']:.4f} val_fg={val_metrics['fg_dice']:.4f} "
-            f"RV={val_metrics.get('dice_RV', 0.0):.4f} MYO={val_metrics.get('dice_MYO', 0.0):.4f} LV={val_metrics.get('dice_LV', 0.0):.4f} "
-            f"hd95={val_metrics.get('hd95_fg_mean', math.nan):.3f} bf1={val_metrics.get('boundary_f1_fg', math.nan):.4f} "
-            f"bfreq={val_metrics['boundary_frequency']:.4f} hf_pen={val_metrics['hf_ratio_penalty']:.4f} "
-            f"gate_reg={val_metrics['gate_reg']:.5f}"
-        )
-        if log_ssr:
-            print_detailed_logs(train_logs, "train")
-            print_detailed_logs(val_logs, "val")
+        print_epoch_report(epoch, train_metrics, val_metrics)
+        log_wandb_metrics(wandb_run, epoch, train_metrics, val_metrics, {"lr": optimizer.param_groups[0]["lr"]})
 
     torch.save({"epoch": int(cfg["epochs"]), "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(), "config": cfg}, run_dir / "final_model.pt")
     plot_training_curves(run_dir, training_rows, ssr_rows)
@@ -877,6 +1017,7 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
         f.write("\n")
     print(f"Finished S3R run. Best val fg mean={best_val:.4f} at epoch {best_epoch}.")
     print(f"Artifacts saved under {run_dir}")
+    finish_wandb(wandb_run)
     return summary
 
 

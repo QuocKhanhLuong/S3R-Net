@@ -1,16 +1,5 @@
+"""Data loaders for S3R experiments."""
 
-from .data_utils import (
-    MedicalImageSegmentationDataset,
-    MetricsCalculator,
-    MonogenicDataset,
-    JointVectorRotation,
-    JointRandomFlip
-)
+from .acdc_s3r_dataset import ACDCSSRSliceDataset, load_or_create_split
 
-__all__ = [
-    'MedicalImageSegmentationDataset',
-    'MetricsCalculator',
-    'MonogenicDataset',
-    'JointVectorRotation',
-    'JointRandomFlip'
-]
+__all__ = ["ACDCSSRSliceDataset", "load_or_create_split"]

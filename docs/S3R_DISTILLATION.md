@@ -100,6 +100,13 @@ python src/distillation/train_s3r_distill.py \
   --run_name smoke_s3r_scsd_phase3
 ```
 
+Optional reporting flags:
+
+```bash
+--no_tqdm
+--wandb --wandb_project s3r-scsd --wandb_run_name my_distill_run
+```
+
 ## Real Teacher Integration
 
 Next steps for real teachers:
