@@ -15,6 +15,7 @@ CHECKPOINT_EXTENSIONS = (".pt", ".pth", ".ckpt", ".safetensors", ".bin")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download frozen teacher checkpoints")
+    parser.add_argument("--teacher", choices=["medical_sam3", "cinema", "both"], default="both")
     parser.add_argument("--medical_sam3_repo", default="ChongCong/Medical-SAM3")
     parser.add_argument("--cinema_repo", default="mathpluscode/CineMA")
     parser.add_argument("--output_dir", default="checkpoints/teachers")
@@ -31,10 +32,11 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    downloads = [
-        ("medical_sam3", args.medical_sam3_repo, output_dir / "medical_sam3"),
-        ("cinema", args.cinema_repo, output_dir / "cinema"),
-    ]
+    downloads = []
+    if args.teacher in {"medical_sam3", "both"}:
+        downloads.append(("medical_sam3", args.medical_sam3_repo, output_dir / "medical_sam3"))
+    if args.teacher in {"cinema", "both"}:
+        downloads.append(("cinema", args.cinema_repo, output_dir / "cinema"))
     manifest: dict[str, Any] = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "teachers": {},

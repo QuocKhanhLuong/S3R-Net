@@ -70,6 +70,12 @@ Clone teacher repos:
 bash scripts/setup_teachers.sh
 ```
 
+For a lighter one-teacher setup:
+
+```bash
+bash scripts/setup_teachers.sh cinema
+```
+
 Install HF helpers if needed:
 
 ```bash
@@ -80,7 +86,17 @@ Download teacher weights:
 
 ```bash
 python scripts/download_teachers.py \
+  --teacher both \
   --medical_sam3_repo ChongCong/Medical-SAM3 \
+  --cinema_repo mathpluscode/CineMA \
+  --output_dir checkpoints/teachers
+```
+
+Medical-SAM3 weights are large. To download only CineMA:
+
+```bash
+python scripts/download_teachers.py \
+  --teacher cinema \
   --cinema_repo mathpluscode/CineMA \
   --output_dir checkpoints/teachers
 ```

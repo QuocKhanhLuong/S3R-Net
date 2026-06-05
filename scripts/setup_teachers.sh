@@ -4,6 +4,15 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+TEACHER="${1:-both}"
+case "$TEACHER" in
+  medical_sam3|cinema|both) ;;
+  *)
+    echo "Usage: bash scripts/setup_teachers.sh [medical_sam3|cinema|both]"
+    exit 2
+    ;;
+esac
+
 mkdir -p external checkpoints/teachers/medical_sam3 checkpoints/teachers/cinema
 
 clone_teacher_repo() {
@@ -32,7 +41,12 @@ clone_teacher_repo() {
   git clone "$url" "$dest"
 }
 
-clone_teacher_repo https://github.com/AIM-Research-Lab/Medical-SAM3 external/Medical-SAM3
-clone_teacher_repo https://github.com/mathpluscode/CineMA external/CineMA
+if [ "$TEACHER" = "medical_sam3" ] || [ "$TEACHER" = "both" ]; then
+  clone_teacher_repo https://github.com/AIM-Research-Lab/Medical-SAM3 external/Medical-SAM3
+fi
+
+if [ "$TEACHER" = "cinema" ] || [ "$TEACHER" = "both" ]; then
+  clone_teacher_repo https://github.com/mathpluscode/CineMA external/CineMA
+fi
 
 echo "Teacher repositories are available under external/."
