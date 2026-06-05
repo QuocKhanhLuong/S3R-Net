@@ -428,6 +428,80 @@ def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+def estimate_model_profile(model: nn.Module, cfg: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    """Estimate S3R student params and FLOPs for one forward pass."""
+    in_channels = int(cfg.get("in_channels") or (5 if str(cfg["input_mode"]).lower() == "25d" else 1))
+    image_size = int(cfg["image_size"])
+    example = torch.zeros(1, in_channels, image_size, image_size, device=device)
+    boundary = torch.zeros(1, 1, image_size, image_size, device=device)
+    profile: dict[str, Any] = {
+        "params": count_parameters(model),
+        "flops": None,
+        "gflops": None,
+        "profile_backend": "unavailable",
+    }
+    was_training = model.training
+    model.eval()
+    try:
+        try:
+            from thop import profile as thop_profile  # type: ignore
+
+            flops, params = thop_profile(model, inputs=(example,), kwargs={"boundary_mask": boundary}, verbose=False)
+            profile.update({"params": int(params), "flops": int(flops), "gflops": float(flops) / 1e9, "profile_backend": "thop"})
+        except Exception:
+            flops = estimate_conv_linear_flops(model, example, boundary)
+            profile.update({"flops": int(flops), "gflops": float(flops) / 1e9, "profile_backend": "conv_linear_hooks"})
+    finally:
+        model.train(was_training)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    return profile
+
+
+def estimate_conv_linear_flops(model: nn.Module, example: Tensor, boundary: Tensor) -> int:
+    """Fallback FLOP estimate for Conv/Linear layers only."""
+    flops = 0
+    hooks = []
+
+    def conv_hook(module: nn.Module, inputs: tuple[Any, ...], output: Tensor) -> None:
+        nonlocal flops
+        if not isinstance(output, Tensor):
+            return
+        batch = int(output.shape[0])
+        out_spatial = int(np.prod(output.shape[2:])) if output.ndim > 2 else 1
+        out_channels = int(output.shape[1]) if output.ndim > 1 else 1
+        kernel = int(np.prod(getattr(module, "kernel_size", (1, 1))))
+        in_channels = int(getattr(module, "in_channels", 1))
+        groups = int(getattr(module, "groups", 1))
+        flops += batch * out_spatial * out_channels * (in_channels // groups) * kernel * 2
+
+    def linear_hook(module: nn.Module, inputs: tuple[Any, ...], output: Tensor) -> None:
+        nonlocal flops
+        if not isinstance(output, Tensor):
+            return
+        batch_items = int(output.numel() // max(int(output.shape[-1]), 1))
+        flops += batch_items * int(module.in_features) * int(module.out_features) * 2
+
+    for module in model.modules():
+        if isinstance(module, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
+            hooks.append(module.register_forward_hook(conv_hook))
+        elif isinstance(module, nn.Linear):
+            hooks.append(module.register_forward_hook(linear_hook))
+    try:
+        with torch.no_grad():
+            model(example, boundary_mask=boundary)
+    finally:
+        for hook in hooks:
+            hook.remove()
+    return flops
+
+
+def format_count(value: int | float | None, scale: float, suffix: str, digits: int = 2) -> str:
+    if value is None:
+        return f"unknown{suffix}"
+    return f"{float(value) / scale:.{digits}f}{suffix}"
+
+
 def foreground_dice_loss(logits: Tensor, target: Tensor, num_classes: int) -> Tensor:
     probs = torch.softmax(logits, dim=1)
     one_hot = F.one_hot(target.long(), num_classes).permute(0, 3, 1, 2).float()
@@ -1220,7 +1294,8 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
     train_loader, val_loader, split_info = make_loaders(cfg)
     model = build_model(cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["lr"]), weight_decay=float(cfg["weight_decay"]))
-    model_params = count_parameters(model)
+    profile = estimate_model_profile(model, cfg, device)
+    model_params = int(profile["params"])
     wandb_run = init_wandb(cfg, run_dir)
     teacher_kd_context = build_teacher_kd_context(cfg, device)
 
@@ -1238,7 +1313,10 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
     print(
         f"S3R run={cfg['run_name']} model={cfg.get('model')} variant={cfg.get('variant')} "
         f"device={device} batch={cfg['actual_batch_size']} image={cfg['image_size']} "
-        f"train_slices={split_info['train_slices']} val_slices={split_info['val_slices']}"
+        f"train_slices={split_info['train_slices']} val_slices={split_info['val_slices']} "
+        f"params={format_count(model_params, 1e6, 'M')} "
+        f"gflops={format_count(profile.get('flops'), 1e9, '')} "
+        f"profile={profile.get('profile_backend')}"
     )
 
     for epoch in range(1, int(cfg["epochs"]) + 1):
@@ -1344,6 +1422,10 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
         "image_size": int(cfg["image_size"]),
         "epochs": int(cfg["epochs"]),
         "model_parameter_count": model_params,
+        "model_parameter_millions": model_params / 1e6,
+        "model_flops": profile.get("flops"),
+        "model_gflops": profile.get("gflops"),
+        "model_profile_backend": profile.get("profile_backend"),
         "train_slices": split_info["train_slices"],
         "val_slices": split_info["val_slices"],
         "train_cases": len(split_info["train_cases"]),
