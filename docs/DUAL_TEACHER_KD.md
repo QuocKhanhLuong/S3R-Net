@@ -190,6 +190,50 @@ python src/training/train_s3r_acdc.py \
   --save_dir weights/smoke_dual_teacher_stub
 ```
 
+## CineMA-Only Real Teacher Test
+
+After cloning CineMA and downloading weights, test the real CineMA wrapper without Medical-SAM3:
+
+```bash
+python scripts/test_teacher_loading.py \
+  --teacher cinema \
+  --data_dir preprocessed_data/ACDC \
+  --cinema_repo_path external/CineMA \
+  --cinema_ckpt_dir checkpoints/teachers/cinema \
+  --cinema_ckpt checkpoints/teachers/cinema/finetuned/segmentation/acdc_sax/acdc_sax_0.safetensors \
+  --cinema_config checkpoints/teachers/cinema/finetuned/segmentation/acdc_sax/config.yaml \
+  --input_mode 25d \
+  --num_classes 4 \
+  --device cuda
+```
+
+Train with CineMA boundary KD only:
+
+```bash
+python src/training/train_s3r_acdc.py \
+  --model s3r_mini \
+  --data_dir preprocessed_data/ACDC \
+  --image_size 224 \
+  --epochs 1 \
+  --batch_size 2 \
+  --max_slices 8 \
+  --input_mode 25d \
+  --in_channels 5 \
+  --use_dual_teacher_kd \
+  --disable_field_kd \
+  --disable_fused_kd \
+  --cinema_repo_path external/CineMA \
+  --cinema_ckpt_dir checkpoints/teachers/cinema \
+  --cinema_ckpt checkpoints/teachers/cinema/finetuned/segmentation/acdc_sax/acdc_sax_0.safetensors \
+  --cinema_config checkpoints/teachers/cinema/finetuned/segmentation/acdc_sax/config.yaml \
+  --lambda_cine_boundary 0.5 \
+  --lambda_spec 0.05 \
+  --device cuda \
+  --save_dir weights/smoke_cinema_real_kd
+```
+
+The trainer prints the effective KD lambdas and per-epoch KD components, and saves `kd_loss_components.png` plus `kd_agreement_weights.png`.
+
 ## Ablations
 
 Flags:

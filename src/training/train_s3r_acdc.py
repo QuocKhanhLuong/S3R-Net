@@ -80,6 +80,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb_mode", default=None)
     parser.add_argument("--use_dual_teacher_kd", action="store_true", default=None)
     parser.add_argument("--teacher_stub", action="store_true", default=None)
+    parser.add_argument("--medical_sam3_stub", action="store_true", default=None)
+    parser.add_argument("--cinema_stub", action="store_true", default=None)
     parser.add_argument("--teacher_cache_dir", default=None)
     parser.add_argument("--strict_teacher_cache", action="store_true", default=None)
     parser.add_argument("--precompute_teachers", action="store_true", default=None)
@@ -89,6 +91,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cinema_repo_path", default=None)
     parser.add_argument("--cinema_ckpt_dir", default=None)
     parser.add_argument("--cinema_ckpt", default=None)
+    parser.add_argument("--cinema_config", default=None)
+    parser.add_argument("--cinema_dataset", default=None)
+    parser.add_argument("--cinema_view", default=None)
+    parser.add_argument("--cinema_seed", type=int, default=None)
     parser.add_argument("--cinema_class_map", default=None)
     parser.add_argument("--kd_temperature", type=float, default=None)
     parser.add_argument("--lambda_field", type=float, default=None)
@@ -159,6 +165,8 @@ def apply_config_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
     kd = cfg.setdefault("dual_teacher_kd", {})
     kd.setdefault("enabled", False)
     kd.setdefault("teacher_stub", False)
+    kd.setdefault("medical_sam3_stub", False)
+    kd.setdefault("cinema_stub", False)
     kd.setdefault("teacher_cache_dir", None)
     kd.setdefault("strict_teacher_cache", False)
     kd.setdefault("precompute_teachers", False)
@@ -168,6 +176,10 @@ def apply_config_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
     kd.setdefault("cinema_repo_path", "external/CineMA")
     kd.setdefault("cinema_ckpt_dir", "checkpoints/teachers/cinema")
     kd.setdefault("cinema_ckpt", "")
+    kd.setdefault("cinema_config", "")
+    kd.setdefault("cinema_dataset", "acdc")
+    kd.setdefault("cinema_view", "sax")
+    kd.setdefault("cinema_seed", 0)
     kd.setdefault("cinema_class_map", "")
     kd.setdefault("kd_temperature", 4.0)
     kd.setdefault("lambda_field", 0.3)
@@ -290,6 +302,8 @@ def apply_variant_and_cli(cfg: dict[str, Any], args: argparse.Namespace) -> dict
         kd_cli["enabled"] = True
     for arg_key, cfg_key in (
         ("teacher_stub", "teacher_stub"),
+        ("medical_sam3_stub", "medical_sam3_stub"),
+        ("cinema_stub", "cinema_stub"),
         ("teacher_cache_dir", "teacher_cache_dir"),
         ("strict_teacher_cache", "strict_teacher_cache"),
         ("precompute_teachers", "precompute_teachers"),
@@ -299,6 +313,10 @@ def apply_variant_and_cli(cfg: dict[str, Any], args: argparse.Namespace) -> dict
         ("cinema_repo_path", "cinema_repo_path"),
         ("cinema_ckpt_dir", "cinema_ckpt_dir"),
         ("cinema_ckpt", "cinema_ckpt"),
+        ("cinema_config", "cinema_config"),
+        ("cinema_dataset", "cinema_dataset"),
+        ("cinema_view", "cinema_view"),
+        ("cinema_seed", "cinema_seed"),
         ("cinema_class_map", "cinema_class_map"),
         ("kd_temperature", "kd_temperature"),
         ("lambda_field", "lambda_field"),
@@ -512,15 +530,17 @@ def build_teacher_kd_context(cfg: dict[str, Any], student_device: torch.device) 
 
     needs_online_teacher = not cache_dir or not bool(kd.get("strict_teacher_cache", False))
     if needs_online_teacher:
-        context["medical_sam3"] = MedicalSAM3Teacher(
-            kd.get("medical_sam3_ckpt_dir"),
-            device=teacher_device,
-            num_classes=int(cfg["num_classes"]),
-            image_size=int(cfg["image_size"]),
-            repo_path=kd.get("medical_sam3_repo_path", "external/Medical-SAM3"),
-            prompt_mode=kd.get("medical_sam3_prompt_mode", "gt_box"),
-            teacher_stub=bool(kd.get("teacher_stub", False)),
-        )
+        need_m3 = needs_medical_sam3_teacher(kd)
+        if need_m3:
+            context["medical_sam3"] = MedicalSAM3Teacher(
+                kd.get("medical_sam3_ckpt_dir"),
+                device=teacher_device,
+                num_classes=int(cfg["num_classes"]),
+                image_size=int(cfg["image_size"]),
+                repo_path=kd.get("medical_sam3_repo_path", "external/Medical-SAM3"),
+                prompt_mode=kd.get("medical_sam3_prompt_mode", "gt_box"),
+                teacher_stub=bool(kd.get("teacher_stub", False)) or bool(kd.get("medical_sam3_stub", False)),
+            )
         context["cinema"] = CineMATeacher(
             kd.get("cinema_ckpt_dir"),
             device=teacher_device,
@@ -528,11 +548,16 @@ def build_teacher_kd_context(cfg: dict[str, Any], student_device: torch.device) 
             image_size=int(cfg["image_size"]),
             repo_path=kd.get("cinema_repo_path", "external/CineMA"),
             checkpoint_path=kd.get("cinema_ckpt") or None,
+            config_path=kd.get("cinema_config") or None,
+            dataset=kd.get("cinema_dataset", "acdc"),
+            view=kd.get("cinema_view", "sax"),
+            seed=int(kd.get("cinema_seed", 0) or 0),
             class_map=kd.get("cinema_class_map") or None,
-            teacher_stub=bool(kd.get("teacher_stub", False)),
+            teacher_stub=bool(kd.get("teacher_stub", False)) or bool(kd.get("cinema_stub", False)),
         )
         try:
-            context["medical_sam3"].load()
+            if context["medical_sam3"] is not None:
+                context["medical_sam3"].load()
             context["cinema"].load()
         except TeacherLoadError as exc:
             if cache_dir and not bool(kd.get("strict_teacher_cache", False)):
@@ -543,14 +568,44 @@ def build_teacher_kd_context(cfg: dict[str, Any], student_device: torch.device) 
                 ) from exc
             raise
 
-    print(
-        "Dual-teacher KD enabled "
-        f"cache={cache_dir or 'online'} teacher_stub={bool(kd.get('teacher_stub', False))} "
-        f"T={kd.get('kd_temperature')} lambdas="
-        f"field:{kd.get('lambda_field')} cine:{kd.get('lambda_cine_boundary')} "
-        f"fuse:{kd.get('lambda_fuse')} spec:{kd.get('lambda_spec')}"
-    )
+    print(format_teacher_kd_startup_log(kd, context, cache_dir))
     return context
+
+
+def needs_medical_sam3_teacher(kd: dict[str, Any]) -> bool:
+    """Return whether current KD settings require Medical-SAM3 outputs."""
+    if bool(kd.get("use_vanilla_kd_only", False)):
+        return True
+    field_enabled = not bool(kd.get("disable_field_kd", False)) and float(kd.get("lambda_field", 0.0) or 0.0) > 0
+    fused_enabled = not bool(kd.get("disable_fused_kd", False)) and float(kd.get("lambda_fuse", 0.0) or 0.0) > 0
+    return field_enabled or fused_enabled
+
+
+def format_teacher_kd_startup_log(kd: dict[str, Any], context: dict[str, Any], cache_dir: str | Path | None) -> str:
+    """Human-readable KD config block printed once per run."""
+    cinema = context.get("cinema")
+    medical = context.get("medical_sam3")
+    lines = [
+        "Dual-teacher KD enabled:",
+        f"  source={'cache:'+str(cache_dir) if cache_dir else 'online teachers'}",
+        f"  teacher_stub={bool(kd.get('teacher_stub', False))} teacher_device={context.get('teacher_device')}",
+        f"  T={kd.get('kd_temperature')} lambda_field={kd.get('lambda_field')} "
+        f"lambda_cine_boundary={kd.get('lambda_cine_boundary')} lambda_fuse={kd.get('lambda_fuse')} "
+        f"lambda_spec={kd.get('lambda_spec')}",
+        f"  disables field={bool(kd.get('disable_field_kd', False))} "
+        f"cine_boundary={bool(kd.get('disable_cine_boundary_kd', False))} "
+        f"fused={bool(kd.get('disable_fused_kd', False))} spectral={bool(kd.get('disable_spectral_kd', False))} "
+        f"agreement={bool(kd.get('disable_agreement_weighting', False))}",
+        f"  Medical-SAM3={'enabled' if medical is not None else 'not required'}",
+    ]
+    if cinema is not None:
+        lines.append(
+            "  CineMA="
+            f"checkpoint:{getattr(cinema, 'checkpoint_path', None)} "
+            f"config:{getattr(cinema, 'config_path', None)} "
+            f"view:{getattr(cinema, 'view', None)}"
+        )
+    return "\n".join(lines)
 
 
 def load_or_compute_teacher_outputs(
@@ -568,9 +623,9 @@ def load_or_compute_teacher_outputs(
             if bool(kd_context["cfg"].get("strict_teacher_cache", False)):
                 raise
 
-    m3 = kd_context.get("medical_sam3")
     cinema = kd_context.get("cinema")
-    if m3 is None or cinema is None:
+    m3 = kd_context.get("medical_sam3")
+    if cinema is None:
         raise FileNotFoundError(
             "Teacher cache item is missing and online teachers are not loaded. "
             "Use --teacher_stub for debug, remove --strict_teacher_cache, or precompute teacher outputs."
@@ -582,15 +637,16 @@ def load_or_compute_teacher_outputs(
     }
     amp_enabled = bool(kd_context["cfg"].get("teacher_amp", False)) and teacher_device.type == "cuda"
     with torch.no_grad(), torch.autocast(device_type=teacher_device.type, enabled=amp_enabled):
-        out_m3 = m3(teacher_batch)
+        out_m3 = m3(teacher_batch) if m3 is not None else None
         out_c = cinema(teacher_batch)
     outputs = {
-        "P_M3": out_m3["probs"].detach(),
-        "C_M3": out_m3["confidence"].detach(),
         "P_C": out_c["probs"].detach(),
         "C_C": out_c["confidence"].detach(),
         "B_C": out_c.get("boundary", torch.zeros_like(out_c["confidence"])).detach(),
     }
+    if out_m3 is not None:
+        outputs["P_M3"] = out_m3["probs"].detach()
+        outputs["C_M3"] = out_m3["confidence"].detach()
     outputs = resize_teacher_output_to_student(outputs, target_shape)
     return {key: value.to(student_device, non_blocking=True).detach() for key, value in outputs.items()}
 
@@ -604,7 +660,8 @@ def load_teacher_outputs_from_cache(
     """Stack per-sample `.pt` teacher cache files into a batch."""
     case_ids = batch["case_id"]
     slice_indices = batch["slice_idx"]
-    tensors: dict[str, list[Tensor]] = {"P_M3": [], "C_M3": [], "P_C": [], "C_C": [], "B_C": []}
+    tensors: dict[str, list[Tensor]] = {"P_C": [], "C_C": [], "B_C": []}
+    optional_tensors: dict[str, list[Tensor]] = {"P_M3": [], "C_M3": []}
     for idx, case_id in enumerate(case_ids):
         slice_idx = int(slice_indices[idx])
         payload = load_dual_teacher_cache(cache_dir, str(case_id), slice_idx, map_location="cpu")
@@ -615,6 +672,17 @@ def load_teacher_outputs_from_cache(
             if not torch.is_tensor(value):
                 value = torch.as_tensor(value)
             tensors[key].append(value.float())
+        for key in optional_tensors:
+            if key in payload:
+                value = payload[key]
+                if not torch.is_tensor(value):
+                    value = torch.as_tensor(value)
+                optional_tensors[key].append(value.float())
+            elif optional_tensors[key]:
+                raise ValueError(f"Teacher cache has inconsistent optional field {key}; missing at {case_id}:{slice_idx}")
+    for key, values in optional_tensors.items():
+        if values:
+            tensors[key] = values
     stacked = {key: torch.stack(values, dim=0).to(device, non_blocking=True).detach() for key, values in tensors.items()}
     stacked = resize_teacher_output_to_student(stacked, target_shape)
     return {key: value.detach() for key, value in stacked.items()}
@@ -687,6 +755,19 @@ def print_epoch_report(epoch: int, train_metrics: dict[str, float], val_metrics:
         f"train_fg={train_metrics.get('fg_dice', math.nan):.4f} "
         f"val_fg={val_metrics.get('fg_dice', math.nan):.4f}"
     )
+    if "loss_kd" in train_metrics:
+        print(
+            "  kd "
+            f"seg={train_metrics.get('loss_seg', math.nan):.4f} "
+            f"kd={train_metrics.get('loss_kd', math.nan):.4f} "
+            f"field={train_metrics.get('loss_field', math.nan):.4f} "
+            f"cine_boundary={train_metrics.get('loss_cine_boundary', math.nan):.4f} "
+            f"fuse={train_metrics.get('loss_fuse', math.nan):.4f} "
+            f"spec={train_metrics.get('loss_spec', math.nan):.4f} "
+            f"agree={train_metrics.get('agreement_mean', math.nan):.4f} "
+            f"W_M3={train_metrics.get('W_M3_mean', math.nan):.4f} "
+            f"W_C={train_metrics.get('W_C_mean', math.nan):.4f}"
+        )
     print(format_class_metric_table(val_metrics))
 
 
@@ -1001,6 +1082,32 @@ def plot_training_curves(run_dir: Path, rows: list[dict[str, Any]], ssr_rows: li
         plt.savefig(run_dir / "val_dice_curve.png", dpi=160)
         plt.close()
 
+        kd_keys = ["train_loss_field", "train_loss_cine_boundary", "train_loss_fuse", "train_loss_spec", "train_loss_kd"]
+        if any(key in rows[0] for key in kd_keys):
+            plt.figure(figsize=(8, 4.5))
+            for key in kd_keys:
+                if key in rows[0]:
+                    plt.plot(epochs, [row.get(key, math.nan) for row in rows], label=key.replace("train_", ""))
+            plt.xlabel("epoch")
+            plt.ylabel("loss")
+            plt.legend(fontsize=8)
+            plt.tight_layout()
+            plt.savefig(run_dir / "kd_loss_components.png", dpi=160)
+            plt.close()
+
+        kd_weight_keys = ["train_agreement_mean", "train_W_M3_mean", "train_W_C_mean"]
+        if any(key in rows[0] for key in kd_weight_keys):
+            plt.figure(figsize=(8, 4.5))
+            for key in kd_weight_keys:
+                if key in rows[0]:
+                    plt.plot(epochs, [row.get(key, math.nan) for row in rows], label=key.replace("train_", ""))
+            plt.xlabel("epoch")
+            plt.ylim(0, 1)
+            plt.legend(fontsize=8)
+            plt.tight_layout()
+            plt.savefig(run_dir / "kd_agreement_weights.png", dpi=160)
+            plt.close()
+
     _plot_ssr_metrics(run_dir, ssr_rows)
 
 
@@ -1255,6 +1362,8 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
             "ssr_logs.csv",
             "loss_curve.png",
             "val_dice_curve.png",
+            "kd_loss_components.png",
+            "kd_agreement_weights.png",
             "gate_curves.png",
             "contribution_curves.png",
             "high_freq_ratio_curves.png",

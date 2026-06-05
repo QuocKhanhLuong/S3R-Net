@@ -180,6 +180,21 @@ python scripts/test_teacher_loading.py \
 
 Teachers are frozen and used only during training. Inference remains S3R-only.
 
+Test CineMA real wrapper only:
+
+```bash
+python scripts/test_teacher_loading.py \
+  --teacher cinema \
+  --data_dir preprocessed_data/ACDC \
+  --cinema_repo_path external/CineMA \
+  --cinema_ckpt_dir checkpoints/teachers/cinema \
+  --cinema_ckpt checkpoints/teachers/cinema/finetuned/segmentation/acdc_sax/acdc_sax_0.safetensors \
+  --cinema_config checkpoints/teachers/cinema/finetuned/segmentation/acdc_sax/config.yaml \
+  --input_mode 25d \
+  --num_classes 4 \
+  --device cuda
+```
+
 ## Data
 
 Default supervised and distillation commands expect:

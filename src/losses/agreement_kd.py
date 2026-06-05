@@ -163,8 +163,23 @@ def compute_dual_teacher_kd_loss(
     device = logits.device
     zero = torch.zeros((), device=device, dtype=logits.dtype)
     kd = cfg.get("dual_teacher_kd", cfg)
-    p_m3 = _pick(teacher_outputs, "P_M3", "medical_sam3_probs", "m3_probs", "probs_m3").to(device)
     p_c = _pick(teacher_outputs, "P_C", "cinema_probs", "cine_probs", "probs_c").to(device)
+    need_m3 = (
+        bool(kd.get("use_vanilla_kd_only", False))
+        or not bool(kd.get("disable_field_kd", False))
+        or not bool(kd.get("disable_fused_kd", False))
+    )
+    p_m3 = _pick(
+        teacher_outputs,
+        "P_M3",
+        "medical_sam3_probs",
+        "m3_probs",
+        "probs_m3",
+        default=None if not need_m3 else _MISSING,
+    )
+    if p_m3 is None:
+        p_m3 = p_c.detach()
+    p_m3 = p_m3.to(device)
     c_m3 = _pick(teacher_outputs, "C_M3", "medical_sam3_confidence", "m3_confidence", default=torch.ones_like(p_m3[:, :1])).to(device)
     c_c = _pick(teacher_outputs, "C_C", "cinema_confidence", "cine_confidence", default=torch.ones_like(p_c[:, :1])).to(device)
     b_c = _pick(teacher_outputs, "B_C", "cinema_boundary", "boundary", default=None)
