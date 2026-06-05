@@ -17,6 +17,8 @@ from src.distillation.teacher_targets import (
     spectral_boundary_target,
     teacher_agreement_weight,
 )
+from src.losses.agreement_kd import agreement_aware_fusion, compute_dual_teacher_kd_loss
+from src.teachers import CineMATeacher, MedicalSAM3Teacher
 
 
 def test_teacher_cache_round_trip_and_validation(tmp_path: Path) -> None:
@@ -105,3 +107,71 @@ def test_s3r_scsd_loss_supports_dual_routing_and_state_kd() -> None:
     for key in ("semantic_kd", "boundary_kd", "distance_kd", "spectral_boundary_kd", "state_kd"):
         assert key in parts
         assert math.isfinite(parts[key])
+
+
+def test_agreement_weighting_applies_without_region_routing() -> None:
+    student = {
+        "seg_logits": torch.randn(1, 4, 12, 12),
+        "boundary_logits": torch.randn(1, 1, 12, 12),
+    }
+    teacher = {
+        "t1_probs": torch.softmax(torch.randn(1, 4, 12, 12), dim=1),
+        "t2_boundary": torch.rand(1, 1, 12, 12),
+        "agreement_weight": torch.zeros(1, 1, 12, 12),
+    }
+    loss_fn = S3RSCSDLoss(
+        num_classes=4,
+        loss_weights={"semantic_kd": 1.0, "boundary_kd": 1.0, "agreement_weighting": True, "region_routing": False},
+    )
+
+    loss, parts = loss_fn(student, None, teacher)
+
+    assert math.isfinite(float(loss.detach()))
+    assert parts["agreement_mean"] == 0.0
+    assert parts["semantic_kd"] == 0.0
+    assert parts["boundary_kd"] == 0.0
+
+
+def test_agreement_aware_fusion_normalizes_and_bounds_weights() -> None:
+    B, C, H, W = 2, 4, 16, 16
+    p_m3 = torch.softmax(torch.randn(B, C, H, W), dim=1)
+    p_c = torch.softmax(torch.randn(B, C, H, W), dim=1)
+    fusion = agreement_aware_fusion(
+        p_m3,
+        p_c,
+        torch.rand(B, 1, H, W),
+        torch.rand(B, 1, H, W),
+        gt_mask=torch.randint(0, C, (B, H, W)),
+    )
+
+    assert fusion["P_F"].shape == (B, C, H, W)
+    assert torch.allclose(fusion["P_F"].sum(dim=1), torch.ones(B, H, W), atol=1e-5)
+    for key in ("agreement", "W_M3", "W_C", "W_boundary", "W_interior"):
+        assert torch.isfinite(fusion[key]).all()
+        assert float(fusion[key].min()) >= 0.0
+        assert float(fusion[key].max()) <= 1.0
+
+
+def test_dual_teacher_kd_loss_and_stub_outputs_are_finite() -> None:
+    batch = {
+        "image": torch.randn(2, 1, 16, 16),
+        "mask": torch.randint(0, 4, (2, 16, 16)),
+    }
+    m3 = MedicalSAM3Teacher(None, device="cpu", num_classes=4, teacher_stub=True)
+    cinema = CineMATeacher(None, device="cpu", num_classes=4, teacher_stub=True)
+    out_m3 = m3(batch)
+    out_c = cinema(batch)
+    teacher = {
+        "P_M3": out_m3["probs"],
+        "C_M3": out_m3["confidence"],
+        "P_C": out_c["probs"],
+        "C_C": out_c["confidence"],
+        "B_C": out_c["boundary"],
+    }
+    student = {"seg_logits": torch.randn(2, 4, 16, 16)}
+
+    loss, parts, fusion = compute_dual_teacher_kd_loss(student, teacher, batch["mask"], {"dual_teacher_kd": {}})
+
+    assert math.isfinite(float(loss.detach()))
+    assert parts["loss_kd"] >= 0.0
+    assert fusion["P_F"].shape == (2, 4, 16, 16)

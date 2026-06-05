@@ -1,8 +1,4 @@
-"""S3R-Net model family.
-
-Legacy SpecMamba/HRNet models remain in `src/models`; this package is the new
-default path for future S3R experiments.
-"""
+"""S3R-Net model family and default model path."""
 
 from .losses import S3RLoss, boundary_map_from_mask
 from .s3r_blocks import (

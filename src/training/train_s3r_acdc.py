@@ -37,6 +37,9 @@ from models.s3r import S3RLoss, build_s3r_model
 from models.s3r.losses import boundary_map_from_mask
 from models.s3r.metrics import HAS_SCIPY, segmentation_surface_metrics
 from models.s3r.spectral_utils import build_radial_frequency_masks
+from losses.agreement_kd import compute_dual_teacher_kd_loss
+from teachers import CineMATeacher, MedicalSAM3Teacher, TeacherLoadError
+from teachers.teacher_utils import load_dual_teacher_cache, resize_teacher_output_to_student
 
 
 CLASS_NAMES = ["BG", "RV", "MYO", "LV"]
@@ -75,6 +78,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb_entity", default=None)
     parser.add_argument("--wandb_run_name", default=None)
     parser.add_argument("--wandb_mode", default=None)
+    parser.add_argument("--use_dual_teacher_kd", action="store_true", default=None)
+    parser.add_argument("--teacher_stub", action="store_true", default=None)
+    parser.add_argument("--teacher_cache_dir", default=None)
+    parser.add_argument("--strict_teacher_cache", action="store_true", default=None)
+    parser.add_argument("--precompute_teachers", action="store_true", default=None)
+    parser.add_argument("--medical_sam3_repo_path", default=None)
+    parser.add_argument("--medical_sam3_ckpt_dir", default=None)
+    parser.add_argument("--medical_sam3_prompt_mode", default=None)
+    parser.add_argument("--cinema_repo_path", default=None)
+    parser.add_argument("--cinema_ckpt_dir", default=None)
+    parser.add_argument("--cinema_ckpt", default=None)
+    parser.add_argument("--cinema_class_map", default=None)
+    parser.add_argument("--kd_temperature", type=float, default=None)
+    parser.add_argument("--lambda_field", type=float, default=None)
+    parser.add_argument("--lambda_cine_boundary", type=float, default=None)
+    parser.add_argument("--lambda_fuse", type=float, default=None)
+    parser.add_argument("--lambda_spec", type=float, default=None)
+    parser.add_argument("--teacher_amp", action="store_true", default=None)
+    parser.add_argument("--teacher_device", default=None)
+    parser.add_argument("--teacher_eval_every", type=int, default=None)
+    parser.add_argument("--disable_field_kd", action="store_true", default=None)
+    parser.add_argument("--disable_cine_boundary_kd", action="store_true", default=None)
+    parser.add_argument("--disable_fused_kd", action="store_true", default=None)
+    parser.add_argument("--disable_spectral_kd", action="store_true", default=None)
+    parser.add_argument("--disable_agreement_weighting", action="store_true", default=None)
+    parser.add_argument("--use_vanilla_kd_only", action="store_true", default=None)
     return parser.parse_args()
 
 
@@ -126,6 +155,34 @@ def apply_config_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
     wandb_cfg.setdefault("entity", None)
     wandb_cfg.setdefault("run_name", None)
     wandb_cfg.setdefault("mode", "online")
+
+    kd = cfg.setdefault("dual_teacher_kd", {})
+    kd.setdefault("enabled", False)
+    kd.setdefault("teacher_stub", False)
+    kd.setdefault("teacher_cache_dir", None)
+    kd.setdefault("strict_teacher_cache", False)
+    kd.setdefault("precompute_teachers", False)
+    kd.setdefault("medical_sam3_repo_path", "external/Medical-SAM3")
+    kd.setdefault("medical_sam3_ckpt_dir", "checkpoints/teachers/medical_sam3")
+    kd.setdefault("medical_sam3_prompt_mode", "gt_box")
+    kd.setdefault("cinema_repo_path", "external/CineMA")
+    kd.setdefault("cinema_ckpt_dir", "checkpoints/teachers/cinema")
+    kd.setdefault("cinema_ckpt", "")
+    kd.setdefault("cinema_class_map", "")
+    kd.setdefault("kd_temperature", 4.0)
+    kd.setdefault("lambda_field", 0.3)
+    kd.setdefault("lambda_cine_boundary", 0.5)
+    kd.setdefault("lambda_fuse", 0.5)
+    kd.setdefault("lambda_spec", 0.05)
+    kd.setdefault("teacher_amp", False)
+    kd.setdefault("teacher_device", "cuda")
+    kd.setdefault("teacher_eval_every", 0)
+    kd.setdefault("disable_field_kd", False)
+    kd.setdefault("disable_cine_boundary_kd", False)
+    kd.setdefault("disable_fused_kd", False)
+    kd.setdefault("disable_spectral_kd", False)
+    kd.setdefault("disable_agreement_weighting", False)
+    kd.setdefault("use_vanilla_kd_only", False)
 
     loss_weights = cfg.setdefault("loss_weights", {})
     loss_weights.setdefault("boundary_bce", 0.50)
@@ -228,6 +285,41 @@ def apply_variant_and_cli(cfg: dict[str, Any], args: argparse.Namespace) -> dict
             cfg.setdefault("wandb", {})[cfg_key] = value
     if args.input_mode is not None and args.in_channels is None:
         cfg["in_channels"] = 5 if str(args.input_mode).lower() == "25d" else 1
+    kd_cli: dict[str, Any] = {}
+    if args.use_dual_teacher_kd:
+        kd_cli["enabled"] = True
+    for arg_key, cfg_key in (
+        ("teacher_stub", "teacher_stub"),
+        ("teacher_cache_dir", "teacher_cache_dir"),
+        ("strict_teacher_cache", "strict_teacher_cache"),
+        ("precompute_teachers", "precompute_teachers"),
+        ("medical_sam3_repo_path", "medical_sam3_repo_path"),
+        ("medical_sam3_ckpt_dir", "medical_sam3_ckpt_dir"),
+        ("medical_sam3_prompt_mode", "medical_sam3_prompt_mode"),
+        ("cinema_repo_path", "cinema_repo_path"),
+        ("cinema_ckpt_dir", "cinema_ckpt_dir"),
+        ("cinema_ckpt", "cinema_ckpt"),
+        ("cinema_class_map", "cinema_class_map"),
+        ("kd_temperature", "kd_temperature"),
+        ("lambda_field", "lambda_field"),
+        ("lambda_cine_boundary", "lambda_cine_boundary"),
+        ("lambda_fuse", "lambda_fuse"),
+        ("lambda_spec", "lambda_spec"),
+        ("teacher_amp", "teacher_amp"),
+        ("teacher_device", "teacher_device"),
+        ("teacher_eval_every", "teacher_eval_every"),
+        ("disable_field_kd", "disable_field_kd"),
+        ("disable_cine_boundary_kd", "disable_cine_boundary_kd"),
+        ("disable_fused_kd", "disable_fused_kd"),
+        ("disable_spectral_kd", "disable_spectral_kd"),
+        ("disable_agreement_weighting", "disable_agreement_weighting"),
+        ("use_vanilla_kd_only", "use_vanilla_kd_only"),
+    ):
+        value = getattr(args, arg_key)
+        if value is not None:
+            kd_cli[cfg_key] = value
+    if kd_cli:
+        cfg.setdefault("dual_teacher_kd", {}).update(kd_cli)
     return apply_config_defaults(cfg)
 
 
@@ -398,6 +490,136 @@ def compute_loss(
     }
 
 
+def build_teacher_kd_context(cfg: dict[str, Any], student_device: torch.device) -> dict[str, Any] | None:
+    """Build optional dual-teacher KD runtime context."""
+    kd = cfg.get("dual_teacher_kd", {})
+    if not bool(kd.get("enabled", False)):
+        return None
+    teacher_device_name = str(kd.get("teacher_device") or student_device)
+    if teacher_device_name == "cuda" and not torch.cuda.is_available():
+        print("Teacher CUDA requested but unavailable; using CPU for teachers.")
+        teacher_device_name = "cpu"
+    teacher_device = torch.device(teacher_device_name)
+    context: dict[str, Any] = {
+        "cfg": kd,
+        "teacher_device": teacher_device,
+        "medical_sam3": None,
+        "cinema": None,
+    }
+    cache_dir = kd.get("teacher_cache_dir")
+    if cache_dir:
+        context["cache_dir"] = Path(str(cache_dir))
+
+    needs_online_teacher = not cache_dir or not bool(kd.get("strict_teacher_cache", False))
+    if needs_online_teacher:
+        context["medical_sam3"] = MedicalSAM3Teacher(
+            kd.get("medical_sam3_ckpt_dir"),
+            device=teacher_device,
+            num_classes=int(cfg["num_classes"]),
+            image_size=int(cfg["image_size"]),
+            repo_path=kd.get("medical_sam3_repo_path", "external/Medical-SAM3"),
+            prompt_mode=kd.get("medical_sam3_prompt_mode", "gt_box"),
+            teacher_stub=bool(kd.get("teacher_stub", False)),
+        )
+        context["cinema"] = CineMATeacher(
+            kd.get("cinema_ckpt_dir"),
+            device=teacher_device,
+            num_classes=int(cfg["num_classes"]),
+            image_size=int(cfg["image_size"]),
+            repo_path=kd.get("cinema_repo_path", "external/CineMA"),
+            checkpoint_path=kd.get("cinema_ckpt") or None,
+            class_map=kd.get("cinema_class_map") or None,
+            teacher_stub=bool(kd.get("teacher_stub", False)),
+        )
+        try:
+            context["medical_sam3"].load()
+            context["cinema"].load()
+        except TeacherLoadError as exc:
+            if cache_dir and not bool(kd.get("strict_teacher_cache", False)):
+                raise TeacherLoadError(
+                    f"Teacher cache is enabled but online fallback could not load teachers: {exc}. "
+                    "Either precompute the missing cache files, use --strict_teacher_cache to fail at the missing cache item, "
+                    "or use --teacher_stub for debug."
+                ) from exc
+            raise
+
+    print(
+        "Dual-teacher KD enabled "
+        f"cache={cache_dir or 'online'} teacher_stub={bool(kd.get('teacher_stub', False))} "
+        f"T={kd.get('kd_temperature')} lambdas="
+        f"field:{kd.get('lambda_field')} cine:{kd.get('lambda_cine_boundary')} "
+        f"fuse:{kd.get('lambda_fuse')} spec:{kd.get('lambda_spec')}"
+    )
+    return context
+
+
+def load_or_compute_teacher_outputs(
+    kd_context: dict[str, Any],
+    batch: dict[str, Any],
+    target_shape: tuple[int, ...],
+    student_device: torch.device,
+) -> dict[str, Tensor]:
+    """Load teacher cache or run frozen teachers for one batch."""
+    cache_dir = kd_context.get("cache_dir")
+    if cache_dir is not None:
+        try:
+            return load_teacher_outputs_from_cache(cache_dir, batch, target_shape, student_device)
+        except FileNotFoundError:
+            if bool(kd_context["cfg"].get("strict_teacher_cache", False)):
+                raise
+
+    m3 = kd_context.get("medical_sam3")
+    cinema = kd_context.get("cinema")
+    if m3 is None or cinema is None:
+        raise FileNotFoundError(
+            "Teacher cache item is missing and online teachers are not loaded. "
+            "Use --teacher_stub for debug, remove --strict_teacher_cache, or precompute teacher outputs."
+        )
+    teacher_device = kd_context["teacher_device"]
+    teacher_batch = {
+        key: value.to(teacher_device, non_blocking=True) if torch.is_tensor(value) else value
+        for key, value in batch.items()
+    }
+    amp_enabled = bool(kd_context["cfg"].get("teacher_amp", False)) and teacher_device.type == "cuda"
+    with torch.no_grad(), torch.autocast(device_type=teacher_device.type, enabled=amp_enabled):
+        out_m3 = m3(teacher_batch)
+        out_c = cinema(teacher_batch)
+    outputs = {
+        "P_M3": out_m3["probs"].detach(),
+        "C_M3": out_m3["confidence"].detach(),
+        "P_C": out_c["probs"].detach(),
+        "C_C": out_c["confidence"].detach(),
+        "B_C": out_c.get("boundary", torch.zeros_like(out_c["confidence"])).detach(),
+    }
+    outputs = resize_teacher_output_to_student(outputs, target_shape)
+    return {key: value.to(student_device, non_blocking=True).detach() for key, value in outputs.items()}
+
+
+def load_teacher_outputs_from_cache(
+    cache_dir: Path,
+    batch: dict[str, Any],
+    target_shape: tuple[int, ...],
+    device: torch.device,
+) -> dict[str, Tensor]:
+    """Stack per-sample `.pt` teacher cache files into a batch."""
+    case_ids = batch["case_id"]
+    slice_indices = batch["slice_idx"]
+    tensors: dict[str, list[Tensor]] = {"P_M3": [], "C_M3": [], "P_C": [], "C_C": [], "B_C": []}
+    for idx, case_id in enumerate(case_ids):
+        slice_idx = int(slice_indices[idx])
+        payload = load_dual_teacher_cache(cache_dir, str(case_id), slice_idx, map_location="cpu")
+        for key in tensors:
+            if key not in payload:
+                raise ValueError(f"Teacher cache for {case_id}:{slice_idx} is missing required field {key}")
+            value = payload[key]
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value)
+            tensors[key].append(value.float())
+    stacked = {key: torch.stack(values, dim=0).to(device, non_blocking=True).detach() for key, values in tensors.items()}
+    stacked = resize_teacher_output_to_student(stacked, target_shape)
+    return {key: value.detach() for key, value in stacked.items()}
+
+
 def append_classification_metrics(
     metrics: dict[str, float],
     tp: Tensor,
@@ -524,6 +746,7 @@ def run_epoch(
     epoch: int,
     split: str,
     log_ssr: bool,
+    kd_context: dict[str, Any] | None = None,
 ) -> tuple[dict[str, float], list[dict[str, Any]], dict[str, Any] | None]:
     training = optimizer is not None
     model.train(training)
@@ -556,6 +779,29 @@ def run_epoch(
                 optimizer.zero_grad(set_to_none=True)
             outputs = model(images, boundary_mask=boundary_target, return_logs=return_logs)
             loss, parts = compute_loss(outputs, masks, boundary_target, cfg)
+            parts["loss_seg"] = parts["loss"]
+            if training and kd_context is not None:
+                eval_every = int(kd_context["cfg"].get("teacher_eval_every", 0) or 0)
+                should_eval_teacher = eval_every <= 0 or batch_idx % eval_every == 0
+                if should_eval_teacher:
+                    teacher_outputs = load_or_compute_teacher_outputs(kd_context, batch, tuple(outputs["seg_logits"].shape), device)
+                    kd_loss, kd_parts, _ = compute_dual_teacher_kd_loss(outputs, teacher_outputs, masks, cfg)
+                    loss = loss + kd_loss
+                    parts.update(kd_parts)
+                    parts["loss"] = float(loss.detach().cpu())
+                else:
+                    parts.update(
+                        {
+                            "loss_field": 0.0,
+                            "loss_cine_boundary": 0.0,
+                            "loss_fuse": 0.0,
+                            "loss_spec": 0.0,
+                            "loss_kd": 0.0,
+                            "agreement_mean": math.nan,
+                            "W_M3_mean": math.nan,
+                            "W_C_mean": math.nan,
+                        }
+                    )
             if training:
                 loss.backward()
                 grad_clip = float(cfg.get("grad_clip", 0.0) or 0.0)
@@ -865,6 +1111,7 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["lr"]), weight_decay=float(cfg["weight_decay"]))
     model_params = count_parameters(model)
     wandb_run = init_wandb(cfg, run_dir)
+    teacher_kd_context = build_teacher_kd_context(cfg, device)
 
     with open(run_dir / "config_resolved.yaml", "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
@@ -887,7 +1134,7 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
         log_ssr = bool(cfg.get("return_logs", False)) and (
             epoch == 1 or epoch % 5 == 0 or epoch == int(cfg["epochs"])
         )
-        train_metrics, train_ssr_rows, train_logs = run_epoch(model, train_loader, optimizer, device, cfg, epoch, "train", log_ssr)
+        train_metrics, train_ssr_rows, train_logs = run_epoch(model, train_loader, optimizer, device, cfg, epoch, "train", log_ssr, teacher_kd_context)
         val_metrics, val_ssr_rows, val_logs = run_epoch(model, val_loader, None, device, cfg, epoch, "val", log_ssr)
         ssr_rows.extend(train_ssr_rows)
         ssr_rows.extend(val_ssr_rows)
@@ -907,6 +1154,15 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
             "train_tv": train_metrics["tv"],
             "train_gate_reg": train_metrics["gate_reg"],
             "train_hf_ratio_penalty": train_metrics["hf_ratio_penalty"],
+            "train_loss_seg": train_metrics.get("loss_seg", math.nan),
+            "train_loss_field": train_metrics.get("loss_field", math.nan),
+            "train_loss_cine_boundary": train_metrics.get("loss_cine_boundary", math.nan),
+            "train_loss_fuse": train_metrics.get("loss_fuse", math.nan),
+            "train_loss_spec": train_metrics.get("loss_spec", math.nan),
+            "train_loss_kd": train_metrics.get("loss_kd", math.nan),
+            "train_agreement_mean": train_metrics.get("agreement_mean", math.nan),
+            "train_W_M3_mean": train_metrics.get("W_M3_mean", math.nan),
+            "train_W_C_mean": train_metrics.get("W_C_mean", math.nan),
             "val_boundary_bce": val_metrics["boundary_bce"],
             "val_boundary_dice": val_metrics["boundary_dice"],
             "val_bfreq": val_metrics["boundary_frequency"],
@@ -992,6 +1248,7 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
             "hf_ratio_threshold": cfg["ssr"].get("hf_ratio_threshold"),
             "loss_weights": cfg.get("loss_weights", {}),
             "metrics": cfg.get("metrics", {}),
+            "dual_teacher_kd": cfg.get("dual_teacher_kd", {}),
         },
         "artifacts": [
             "training_log.csv",

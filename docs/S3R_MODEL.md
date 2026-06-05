@@ -84,7 +84,7 @@ S3R models return:
 }
 ```
 
-The old `specmamba`, `asym_spec_mamba`, `hrnet_dcn`, and `hrnet_resnet34` files are preserved. New model names are exposed through `src/models/__init__.py`:
+Current public model names are exposed through `src/models/__init__.py`:
 
 - `s3r`
 - `s3r_mini`

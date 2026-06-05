@@ -88,6 +88,11 @@ venv.bak/
 !src/data/
 # Model checkpoints
 checkpoints/
+!checkpoints/
+checkpoints/*
+!checkpoints/teachers/
+!checkpoints/teachers/**/
+!checkpoints/teachers/**/.gitkeep
 checkpoints_egm/
 *.pt
 *.pth

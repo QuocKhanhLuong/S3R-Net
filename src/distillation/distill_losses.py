@@ -87,6 +87,7 @@ class S3RSCSDLoss(nn.Module):
             "spectral_boundary_kd": float(spectral_boundary.detach().cpu()),
             "state_kd": float(state_kd.detach().cpu()),
             "distill_loss": float(total.detach().cpu()),
+            "agreement_mean": float(routing["agreement"].detach().mean().cpu()) if isinstance(routing.get("agreement"), Tensor) else 0.0,
         }
         return total, parts
 
@@ -148,17 +149,22 @@ class S3RSCSDLoss(nn.Module):
         return F.l1_loss(student_summary, target)
 
     def _routing(self, teacher: dict[str, Tensor], gt_mask: Tensor | None, device: torch.device) -> dict[str, Tensor | None]:
-        if not bool(self.loss_weights.get("region_routing", False)):
-            return {"semantic": None, "characteristic": None, "uncertain": None}
-        if "t1_probs" not in teacher or "t2_boundary" not in teacher:
-            return {"semantic": None, "characteristic": None, "uncertain": None}
         agreement = teacher.get("agreement_weight")
-        return region_routing_weights(
+        agreement_map = agreement.to(device).float() if agreement is not None else None
+        if not bool(self.loss_weights.get("region_routing", False)):
+            if bool(self.loss_weights.get("agreement_weighting", False)) and agreement_map is not None:
+                return {"semantic": agreement_map, "characteristic": agreement_map, "uncertain": None, "agreement": agreement_map}
+            return {"semantic": None, "characteristic": None, "uncertain": None, "agreement": agreement_map}
+        if "t1_probs" not in teacher or "t2_boundary" not in teacher:
+            return {"semantic": None, "characteristic": None, "uncertain": None, "agreement": agreement_map}
+        routing = region_routing_weights(
             t1_probs=teacher["t1_probs"].to(device),
             t2_boundary=teacher["t2_boundary"].to(device),
             gt_mask=gt_mask.to(device) if gt_mask is not None else None,
-            agreement_weight=agreement.to(device) if agreement is not None else None,
+            agreement_weight=agreement_map,
         )
+        routing["agreement"] = agreement_map
+        return routing
 
 
 def _weighted_mean(loss: Tensor, weight: Tensor | None) -> Tensor:

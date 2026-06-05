@@ -58,6 +58,7 @@ Detailed docs:
 
 - `docs/S3R_MODEL.md`
 - `docs/S3R_DISTILLATION.md`
+- `docs/DUAL_TEACHER_KD.md`
 
 ## Supervised Training
 
@@ -139,6 +140,45 @@ Distillation uses the same compact metric table and supports:
 --no_tqdm
 --wandb --wandb_project s3r-scsd --wandb_run_name my_distill_run
 ```
+
+## Agreement-Aware Dual-Teacher KD
+
+Optional training-time KD can use frozen Medical-SAM3 and CineMA teachers:
+
+```bash
+python src/training/train_s3r_acdc.py \
+  --model s3r_net \
+  --data_dir preprocessed_data/ACDC/training \
+  --image_size 224 \
+  --epochs 250 \
+  --batch_size 8 \
+  --input_mode 25d \
+  --in_channels 5 \
+  --base_channels 48 \
+  --use_dual_teacher_kd \
+  --teacher_cache_dir teacher_cache/acdc \
+  --kd_temperature 4.0 \
+  --lambda_field 0.3 \
+  --lambda_cine_boundary 0.5 \
+  --lambda_fuse 0.5 \
+  --lambda_spec 0.05 \
+  --save_dir weights/s3r_dual_teacher_kd \
+  --wandb \
+  --wandb_project s3r-acdc \
+  --wandb_run_name s3r_net_dual_teacher_kd
+```
+
+Debug without real teacher weights:
+
+```bash
+python scripts/test_teacher_loading.py \
+  --data_dir preprocessed_data/ACDC/training \
+  --teacher_stub \
+  --num_classes 4 \
+  --device cuda
+```
+
+Teachers are frozen and used only during training. Inference remains S3R-only.
 
 ## Data
 

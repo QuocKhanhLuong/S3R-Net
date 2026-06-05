@@ -111,8 +111,11 @@ Optional reporting flags:
 
 Next steps for real teachers:
 
-- implement a `SemanticTeacher` wrapper for nnU-Net, AsymSpecMambaDCN, or an ensemble
-- implement a `CharacteristicTeacher` wrapper for boundary/SDF/spectral outputs
+- use `src/teachers/medical_sam3_teacher.py` for Medical-SAM3 prompt-driven field targets
+- use `src/teachers/cinema_teacher.py` for CineMA cardiac anatomy and boundary targets
+- keep real teacher integration cache-first until external APIs/checkpoints are pinned
 - include checkpoint hashes and split/fold metadata in generated cache metadata
 - validate class order, image size, and split provenance before training
 - compare against no-KD, single-teacher KD, naive dual-teacher KD, and full S3R-SCSD
+
+See `docs/DUAL_TEACHER_KD.md` for the Medical-SAM3 + CineMA agreement-aware pipeline.
