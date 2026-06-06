@@ -101,6 +101,27 @@ python scripts/download_teachers.py \
   --output_dir checkpoints/teachers
 ```
 
+Medical-SAM3 currently publishes a single large `checkpoint.pt` on Hugging Face.
+To download only that latest main-branch weight:
+
+```bash
+python scripts/download_teachers.py \
+  --teacher medical_sam3 \
+  --medical_sam3_repo ChongCong/Medical-SAM3 \
+  --output_dir checkpoints/teachers
+```
+
+This uses `allow_patterns=["checkpoint.pt"]` by default for Medical-SAM3.
+For reproducible experiments, pin a Hugging Face revision:
+
+```bash
+python scripts/download_teachers.py \
+  --teacher medical_sam3 \
+  --medical_sam3_repo ChongCong/Medical-SAM3 \
+  --revision 116930dd8feae51790703337c4090691f9c4aa05 \
+  --output_dir checkpoints/teachers
+```
+
 If Hugging Face access fails, login:
 
 ```bash

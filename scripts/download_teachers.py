@@ -20,6 +20,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cinema_repo", default="mathpluscode/CineMA")
     parser.add_argument("--output_dir", default="checkpoints/teachers")
     parser.add_argument("--revision", default=None)
+    parser.add_argument("--allow_patterns", default=None, help="Comma-separated HF allow_patterns override.")
+    parser.add_argument("--ignore_patterns", default=None, help="Comma-separated HF ignore_patterns override.")
     return parser.parse_args()
 
 
@@ -34,20 +36,24 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     downloads = []
     if args.teacher in {"medical_sam3", "both"}:
-        downloads.append(("medical_sam3", args.medical_sam3_repo, output_dir / "medical_sam3"))
+        downloads.append(("medical_sam3", args.medical_sam3_repo, output_dir / "medical_sam3", ["checkpoint.pt"]))
     if args.teacher in {"cinema", "both"}:
-        downloads.append(("cinema", args.cinema_repo, output_dir / "cinema"))
+        downloads.append(("cinema", args.cinema_repo, output_dir / "cinema", None))
     manifest: dict[str, Any] = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "teachers": {},
     }
-    for name, repo_id, local_dir in downloads:
+    allow_override = _split_patterns(args.allow_patterns)
+    ignore_override = _split_patterns(args.ignore_patterns)
+    for name, repo_id, local_dir, default_allow_patterns in downloads:
+        allow_patterns = allow_override if allow_override is not None else default_allow_patterns
         try:
             path = snapshot_download(
                 repo_id=repo_id,
                 revision=args.revision,
                 local_dir=str(local_dir),
-                local_dir_use_symlinks=False,
+                allow_patterns=allow_patterns,
+                ignore_patterns=ignore_override,
             )
         except Exception as exc:
             print(f"Failed to download {name} from {repo_id}: {exc}")
@@ -57,7 +63,10 @@ def main() -> None:
         candidates = checkpoint_candidates(Path(path), local_dir)
         manifest["teachers"][name] = {
             "source_repo": repo_id,
+            "revision": args.revision or "main",
             "local_path": str(local_dir),
+            "allow_patterns": allow_patterns,
+            "ignore_patterns": ignore_override,
             "candidate_checkpoint_files": candidates,
         }
         print(f"{name}: downloaded to {local_dir}; {len(candidates)} checkpoint candidates")
@@ -87,6 +96,12 @@ def checkpoint_candidates(download_path: Path, local_dir: Path) -> list[str]:
         except ValueError:
             candidates.append(str(resolved))
     return sorted(candidates)
+
+
+def _split_patterns(value: str | None) -> list[str] | None:
+    if value is None or str(value).strip() == "":
+        return None
+    return [item.strip() for item in str(value).split(",") if item.strip()]
 
 
 if __name__ == "__main__":
