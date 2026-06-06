@@ -101,6 +101,38 @@ python scripts/download_teachers.py \
   --output_dir checkpoints/teachers
 ```
 
+By default this downloads only the ACDC SAX segmentation teacher files:
+
+```text
+finetuned/segmentation/acdc_sax/config.yaml
+finetuned/segmentation/acdc_sax/acdc_sax_0.safetensors
+```
+
+If you accidentally downloaded the full CineMA repository, prune unused weight
+files with a dry-run first:
+
+```bash
+python scripts/prune_cinema_weights.py \
+  --cinema_dir checkpoints/teachers/cinema
+```
+
+Then delete the unused checkpoint files:
+
+```bash
+python scripts/prune_cinema_weights.py \
+  --cinema_dir checkpoints/teachers/cinema \
+  --execute
+```
+
+Keep all three ACDC SAX seeds only if you plan an ensemble:
+
+```bash
+python scripts/prune_cinema_weights.py \
+  --cinema_dir checkpoints/teachers/cinema \
+  --keep_all_acdc_seeds \
+  --execute
+```
+
 Medical-SAM3 currently publishes a single large `checkpoint.pt` on Hugging Face.
 To download only that latest main-branch weight:
 

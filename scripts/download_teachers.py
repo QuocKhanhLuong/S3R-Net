@@ -38,7 +38,14 @@ def main() -> None:
     if args.teacher in {"medical_sam3", "both"}:
         downloads.append(("medical_sam3", args.medical_sam3_repo, output_dir / "medical_sam3", ["checkpoint.pt"]))
     if args.teacher in {"cinema", "both"}:
-        downloads.append(("cinema", args.cinema_repo, output_dir / "cinema", None))
+        downloads.append(
+            (
+                "cinema",
+                args.cinema_repo,
+                output_dir / "cinema",
+                ["finetuned/segmentation/acdc_sax/*"],
+            )
+        )
     manifest: dict[str, Any] = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "teachers": {},
