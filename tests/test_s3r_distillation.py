@@ -177,6 +177,61 @@ def test_dual_teacher_kd_loss_and_stub_outputs_are_finite() -> None:
     assert fusion["P_F"].shape == (2, 4, 16, 16)
 
 
+def test_medical_sam3_real_adapter_binds_inference_module(tmp_path: Path) -> None:
+    repo = tmp_path / "Medical-SAM3"
+    inference_dir = repo / "inference"
+    inference_dir.mkdir(parents=True)
+    (repo / "sam3").mkdir()
+    ckpt_dir = tmp_path / "checkpoints"
+    ckpt_dir.mkdir()
+    (ckpt_dir / "checkpoint.pt").write_bytes(b"fake")
+    (inference_dir / "sam3_inference.py").write_text(
+        """
+import numpy as np
+
+SAM3_ROOT = None
+
+class SAM3Model:
+    def __init__(self, confidence_threshold=0.1, device='cpu', checkpoint_path=None):
+        self.confidence_threshold = confidence_threshold
+        self.device = device
+        self.checkpoint_path = checkpoint_path
+
+    def encode_image(self, image):
+        return {'shape': image.shape}
+
+    def predict_box(self, inference_state, bbox, img_size):
+        h, w = img_size
+        x_min, y_min, x_max, y_max = bbox
+        mask = np.zeros((h, w), dtype=np.uint8)
+        mask[max(y_min, 0):min(y_max + 1, h), max(x_min, 0):min(x_max + 1, w)] = 1
+        return mask
+""",
+        encoding="utf-8",
+    )
+    batch = {
+        "image": torch.rand(1, 5, 16, 16),
+        "mask": torch.zeros(1, 16, 16, dtype=torch.long),
+    }
+    batch["mask"][:, 4:10, 5:12] = 1
+    teacher = MedicalSAM3Teacher(
+        ckpt_dir,
+        device="cpu",
+        num_classes=4,
+        image_size=16,
+        repo_path=repo,
+        teacher_stub=False,
+    )
+
+    out = teacher(batch)
+
+    assert out["probs"].shape == (1, 4, 16, 16)
+    assert out["confidence"].shape == (1, 1, 16, 16)
+    assert out["boundary"].shape == (1, 1, 16, 16)
+    assert torch.isfinite(out["probs"]).all()
+    assert float(out["probs"][:, 1].max()) > 0.0
+
+
 def test_agreement_gated_fused_kd_reports_bounded_weight() -> None:
     gt_mask = torch.zeros(1, 8, 8, dtype=torch.long)
     p_m3 = torch.zeros(1, 4, 8, 8)

@@ -93,9 +93,9 @@ def main() -> None:
         out_c = cinema(batch)
         print("CineMA probs:", tuple(out_c["probs"].shape))
         print("CineMA boundary:", tuple(out_c.get("boundary", torch.empty(0)).shape))
-    if out_c is None:
-        raise RuntimeError("No CineMA output available for preview.")
-    if out_m3 is not None:
+    if out_m3 is None and out_c is None:
+        raise RuntimeError("No teacher output available for preview.")
+    if out_m3 is not None and out_c is not None:
         fusion = agreement_aware_fusion(
             out_m3["probs"],
             out_c["probs"],
@@ -116,7 +116,13 @@ def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return {key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value for key, value in batch.items()}
 
 
-def save_preview(batch: dict[str, Any], out_m3: dict[str, Any] | None, out_c: dict[str, Any], fusion: dict[str, torch.Tensor] | None, path: Path) -> None:
+def save_preview(
+    batch: dict[str, Any],
+    out_m3: dict[str, Any] | None,
+    out_c: dict[str, Any] | None,
+    fusion: dict[str, torch.Tensor] | None,
+    path: Path,
+) -> None:
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -130,11 +136,16 @@ def save_preview(batch: dict[str, Any], out_m3: dict[str, Any] | None, out_c: di
     panels = [
         (image, "image", "gray", None, None),
         (gt, "GT", "viridis", 0, 3),
-        (out_c["probs"][0].argmax(dim=0).detach().cpu(), "CineMA", "viridis", 0, 3),
-        (out_c["boundary"][0, 0].detach().cpu(), "CineMA boundary", "magma", 0, 1),
     ]
     if out_m3 is not None:
-        panels.insert(2, (out_m3["probs"][0].argmax(dim=0).detach().cpu(), "Medical-SAM3", "viridis", 0, 3))
+        panels.append((out_m3["probs"][0].argmax(dim=0).detach().cpu(), "Medical-SAM3", "viridis", 0, 3))
+    if out_c is not None:
+        panels.extend(
+            [
+                (out_c["probs"][0].argmax(dim=0).detach().cpu(), "CineMA", "viridis", 0, 3),
+                (out_c["boundary"][0, 0].detach().cpu(), "CineMA boundary", "magma", 0, 1),
+            ]
+        )
     if fusion is not None:
         panels.extend(
             [

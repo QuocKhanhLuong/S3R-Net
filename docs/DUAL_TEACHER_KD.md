@@ -82,6 +82,14 @@ Install HF helpers if needed:
 pip install -U huggingface_hub safetensors
 ```
 
+Install teacher repos after cloning:
+
+```bash
+pip install -e external/CineMA
+pip install -e external/Medical-SAM3
+pip install iopath opencv-python scikit-image
+```
+
 Download teacher weights:
 
 ```bash
@@ -177,6 +185,24 @@ This writes:
 ```text
 debug_outputs/teacher_kd_preview.png
 ```
+
+Test the real Medical-SAM3 box-prompt adapter:
+
+```bash
+python scripts/test_teacher_loading.py \
+  --teacher medical_sam3 \
+  --data_dir preprocessed_data/ACDC \
+  --medical_sam3_repo_path external/Medical-SAM3 \
+  --medical_sam3_ckpt_dir checkpoints/teachers/medical_sam3 \
+  --medical_sam3_prompt_mode gt_box \
+  --input_mode 25d \
+  --num_classes 4 \
+  --device cuda
+```
+
+The Medical-SAM3 adapter uses GT-derived class boxes during teacher-cache
+generation. This is training-time teacher supervision only; S3R inference stays
+teacher-free.
 
 ## Precompute Cache
 
