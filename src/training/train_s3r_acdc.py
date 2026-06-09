@@ -558,6 +558,111 @@ def format_count(value: int | float | None, scale: float, suffix: str, digits: i
     return f"{float(value) / scale:.{digits}f}{suffix}"
 
 
+def format_pre_epoch_config_table(
+    cfg: dict[str, Any],
+    device: torch.device,
+    split_info: dict[str, Any],
+    profile: dict[str, Any],
+    kd_context: dict[str, Any] | None,
+) -> str:
+    """Return a compact startup table printed before epoch 1."""
+    kd = cfg.get("dual_teacher_kd", {})
+    rows: list[tuple[str, str]] = [
+        ("Run", str(cfg.get("run_name"))),
+        ("Model", f"{cfg.get('model')} variant={cfg.get('variant')}"),
+        ("Device", str(device)),
+        ("Batch size", str(cfg.get("actual_batch_size", cfg.get("batch_size")))),
+        ("Epochs", str(cfg.get("epochs"))),
+        ("Input", f"{cfg.get('input_mode')} channels={cfg.get('in_channels')} image={cfg.get('image_size')}"),
+        ("Train/val slices", f"{split_info.get('train_slices')} / {split_info.get('val_slices')}"),
+        ("Params", format_count(profile.get("params"), 1e6, "M")),
+        ("GFLOPs", f"{format_count(profile.get('flops'), 1e9, '')} backend={profile.get('profile_backend')}"),
+        (
+            "W&B",
+            _status(
+                bool(cfg.get("wandb", {}).get("enabled", False)),
+                f"project={cfg.get('wandb', {}).get('project')} run={cfg.get('wandb', {}).get('run_name') or cfg.get('run_name')}",
+            ),
+        ),
+    ]
+    if not bool(kd.get("enabled", False)):
+        rows.append(("Dual-teacher KD", "disabled"))
+        return _format_ascii_table("Pre-epoch configuration", rows)
+
+    cache_dir = kd_context.get("cache_dir") if kd_context else None
+    source = f"cache:{cache_dir}" if cache_dir else "online teachers"
+    field_active = not bool(kd.get("disable_field_kd", False)) and float(kd.get("lambda_field", 0.0) or 0.0) > 0
+    cine_active = not bool(kd.get("disable_cine_boundary_kd", False)) and float(kd.get("lambda_cine_boundary", 0.0) or 0.0) > 0
+    fuse_active = not bool(kd.get("disable_fused_kd", False)) and float(kd.get("lambda_fuse", 0.0) or 0.0) > 0
+    spec_active = not bool(kd.get("disable_spectral_kd", False)) and float(kd.get("lambda_spec", 0.0) or 0.0) > 0
+    agreement_active = not bool(kd.get("disable_agreement_weighting", False))
+    fused_mode = str(kd.get("fused_kd_weight_mode", "none") or "none").lower()
+
+    rows.extend(
+        [
+            ("Dual-teacher KD", "enabled"),
+            ("Teacher source", source),
+            ("Teacher stub", str(bool(kd.get("teacher_stub", False)))),
+            (
+                "Teacher AMP",
+                _status(
+                    bool(kd.get("teacher_amp", False)),
+                    f"dtype={kd.get('teacher_amp_dtype')} device={kd_context.get('teacher_device') if kd_context else kd.get('teacher_device')}",
+                ),
+            ),
+            ("SAM2/MedSAM2 field", _semantic_teacher_status(kd, kd_context, cache_dir)),
+            ("CineMA boundary/anatomy", _cinema_teacher_status(kd_context, cache_dir)),
+            ("Agreement weighting", _status(agreement_active, "A=exp(-JS(P_M3,P_C))")),
+            (
+                "Fused KD gate",
+                _status(
+                    fuse_active and fused_mode == "agreement",
+                    f"mode={fused_mode} min={kd.get('fused_kd_min_weight')} power={kd.get('fused_kd_agreement_power')}",
+                ),
+            ),
+            ("Field KD", _status(field_active, f"lambda={kd.get('lambda_field')}")),
+            ("Cine boundary KD", _status(cine_active, f"lambda={kd.get('lambda_cine_boundary')}")),
+            ("Fused KD", _status(fuse_active, f"lambda={kd.get('lambda_fuse')}")),
+            ("Spectral KD", _status(spec_active, f"lambda={kd.get('lambda_spec')}")),
+            ("Temperature", str(kd.get("kd_temperature"))),
+        ]
+    )
+    return _format_ascii_table("Pre-epoch configuration", rows)
+
+
+def _status(enabled: bool, detail: str = "") -> str:
+    prefix = "enabled" if enabled else "disabled"
+    return f"{prefix} ({detail})" if detail else prefix
+
+
+def _semantic_teacher_status(kd: dict[str, Any], kd_context: dict[str, Any] | None, cache_dir: Path | str | None) -> str:
+    if not needs_medsam2_teacher(kd):
+        return "disabled by KD flags"
+    if cache_dir is not None:
+        return "enabled via cache (P_M3/C_M3)"
+    if kd_context is not None and kd_context.get("medsam2") is not None:
+        return f"enabled online ({kd.get('medsam2_prompt_mode')})"
+    return "missing"
+
+
+def _cinema_teacher_status(kd_context: dict[str, Any] | None, cache_dir: Path | str | None) -> str:
+    if cache_dir is not None:
+        return "enabled via cache (P_C/C_C/B_C)"
+    if kd_context is not None and kd_context.get("cinema") is not None:
+        return "enabled online"
+    return "missing"
+
+
+def _format_ascii_table(title: str, rows: list[tuple[str, str]]) -> str:
+    key_width = max([len(title), *(len(key) for key, _ in rows)])
+    value_width = max(len(value) for _, value in rows)
+    border = f"+-{'-' * key_width}-+-{'-' * value_width}-+"
+    lines = [border, f"| {title.ljust(key_width)} | {'value'.ljust(value_width)} |", border]
+    lines.extend(f"| {key.ljust(key_width)} | {value.ljust(value_width)} |" for key, value in rows)
+    lines.append(border)
+    return "\n".join(lines)
+
+
 def foreground_dice_loss(logits: Tensor, target: Tensor, num_classes: int) -> Tensor:
     probs = torch.softmax(logits, dim=1)
     one_hot = F.one_hot(target.long(), num_classes).permute(0, 3, 1, 2).float()
@@ -700,7 +805,6 @@ def build_teacher_kd_context(cfg: dict[str, Any], student_device: torch.device) 
                 ) from exc
             raise
 
-    print(format_teacher_kd_startup_log(kd, context, cache_dir))
     return context
 
 
@@ -714,39 +818,6 @@ def needs_medsam2_teacher(kd: dict[str, Any]) -> bool:
 
 
 needs_medical_sam3_teacher = needs_medsam2_teacher
-
-
-def format_teacher_kd_startup_log(kd: dict[str, Any], context: dict[str, Any], cache_dir: str | Path | None) -> str:
-    """Human-readable KD config block printed once per run."""
-    cinema = context.get("cinema")
-    medsam2 = context.get("medsam2")
-    lines = [
-        "Dual-teacher KD enabled:",
-        f"  source={'cache:'+str(cache_dir) if cache_dir else 'online teachers'}",
-        f"  teacher_stub={bool(kd.get('teacher_stub', False))} teacher_device={context.get('teacher_device')} "
-        f"teacher_amp={bool(kd.get('teacher_amp', False))} teacher_amp_dtype={kd.get('teacher_amp_dtype')}",
-        f"  T={kd.get('kd_temperature')} lambda_field={kd.get('lambda_field')} "
-        f"lambda_cine_boundary={kd.get('lambda_cine_boundary')} lambda_fuse={kd.get('lambda_fuse')} "
-        f"lambda_spec={kd.get('lambda_spec')}",
-        f"  fused_kd_weight_mode={kd.get('fused_kd_weight_mode', 'none')} "
-        f"min_weight={kd.get('fused_kd_min_weight')} agreement_power={kd.get('fused_kd_agreement_power')}",
-        f"  disables field={bool(kd.get('disable_field_kd', False))} "
-        f"cine_boundary={bool(kd.get('disable_cine_boundary_kd', False))} "
-        f"fused={bool(kd.get('disable_fused_kd', False))} spectral={bool(kd.get('disable_spectral_kd', False))} "
-        f"agreement={bool(kd.get('disable_agreement_weighting', False))}",
-        f"  MedSAM2={'enabled' if medsam2 is not None else 'not required'}",
-    ]
-    if cinema is not None:
-        cinema_meta = getattr(cinema, "meta", {}) or {}
-        lines.append(
-            "  CineMA="
-            f"checkpoint:{getattr(cinema, 'checkpoint_path', None)} "
-            f"config:{getattr(cinema, 'config_path', None)} "
-            f"view:{getattr(cinema, 'view', None)} "
-            f"backend:{cinema_meta.get('backend', 'unknown')} "
-            f"grad_ckpt_disabled:{cinema_meta.get('disabled_gradient_checkpointing_modules', 0)}"
-        )
-    return "\n".join(lines)
 
 
 def load_or_compute_teacher_outputs(
@@ -1390,14 +1461,11 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
     best_epoch = 0
     best_row: dict[str, Any] | None = None
 
-    print(
-        f"S3R run={cfg['run_name']} model={cfg.get('model')} variant={cfg.get('variant')} "
-        f"device={device} batch={cfg['actual_batch_size']} image={cfg['image_size']} "
-        f"train_slices={split_info['train_slices']} val_slices={split_info['val_slices']} "
-        f"params={format_count(model_params, 1e6, 'M')} "
-        f"gflops={format_count(profile.get('flops'), 1e9, '')} "
-        f"profile={profile.get('profile_backend')}"
-    )
+    startup_table = format_pre_epoch_config_table(cfg, device, split_info, profile, teacher_kd_context)
+    print(startup_table)
+    with open(run_dir / "startup_config_table.txt", "w", encoding="utf-8") as f:
+        f.write(startup_table)
+        f.write("\n")
 
     for epoch in range(1, int(cfg["epochs"]) + 1):
         log_ssr = bool(cfg.get("return_logs", False)) and (
@@ -1528,6 +1596,7 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
             "dual_teacher_kd": cfg.get("dual_teacher_kd", {}),
         },
         "artifacts": [
+            "startup_config_table.txt",
             "training_log.csv",
             "ssr_logs.csv",
             "loss_curve.png",

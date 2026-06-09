@@ -387,6 +387,40 @@ def test_train_config_defaults_teacher_amp_dtype() -> None:
     assert module._resolve_teacher_amp_dtype("float16", torch.device("cpu")) is torch.float16
 
 
+def test_pre_epoch_config_table_reports_cached_dual_teacher_and_profile() -> None:
+    spec = importlib.util.spec_from_file_location("train_s3r_acdc_startup_table", "src/training/train_s3r_acdc.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    cfg = module.apply_config_defaults(module.load_config("configs/s3r_dual_teacher_real_100ep.yaml"))
+    kd = cfg["dual_teacher_kd"]
+    table = module.format_pre_epoch_config_table(
+        cfg,
+        torch.device("cuda"),
+        {"train_slices": 16, "val_slices": 4},
+        {"params": 1_234_567, "flops": 9_876_543_210, "profile_backend": "unit"},
+        {
+            "cfg": kd,
+            "teacher_device": torch.device("cuda"),
+            "cache_dir": Path("teacher_cache/acdc_real"),
+            "medsam2": None,
+            "cinema": None,
+        },
+    )
+
+    assert "Pre-epoch configuration" in table
+    assert "Params" in table and "1.23M" in table
+    assert "GFLOPs" in table and "9.88" in table
+    assert "SAM2/MedSAM2 field" in table
+    assert "enabled via cache" in table
+    assert "P_M3/C_M3" in table
+    assert "CineMA boundary/anatomy" in table
+    assert "P_C/C_C/B_C" in table
+    assert "Agreement weighting" in table and "enabled" in table
+    assert "Fused KD gate" in table and "agreement" in table
+
+
 def test_agreement_gated_fused_kd_reports_bounded_weight() -> None:
     gt_mask = torch.zeros(1, 8, 8, dtype=torch.long)
     p_m3 = torch.zeros(1, 4, 8, 8)
