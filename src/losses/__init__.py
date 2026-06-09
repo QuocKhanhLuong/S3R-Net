@@ -10,6 +10,7 @@ from .agreement_kd import (
     soft_kl_loss,
     spectral_boundary_loss,
 )
+from .reliability_gate import StudentAwareReliabilityGate
 
 __all__ = [
     "agreement_aware_fusion",
@@ -19,5 +20,6 @@ __all__ = [
     "js_divergence",
     "segmentation_field_kd_loss",
     "soft_kl_loss",
+    "StudentAwareReliabilityGate",
     "spectral_boundary_loss",
 ]

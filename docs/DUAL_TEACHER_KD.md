@@ -285,7 +285,8 @@ You can also force float16 with `--teacher_amp_dtype float16`.
 ## Train
 
 Real 100-epoch dual-teacher KD from the precomputed MedSAM2 + CineMA cache.
-The config uses batch size 4 and logs to W&B project `s3r-acdc`:
+The config uses batch size 4, logs to W&B project `s3r-acdc`, and enables the
+pixel-wise student-aware reliability gate:
 
 ```bash
 python src/training/train_s3r_acdc.py \
@@ -296,6 +297,25 @@ This config is intentionally strict: `teacher_stub`, `medsam2_stub`, and
 `cinema_stub` are all `false`, and `strict_teacher_cache` is `true`. If a cache
 item is missing, training fails instead of silently falling back to online or
 stub teachers.
+
+Before epoch 1 the trainer prints a startup table with params, GFLOPs, teacher
+source, agreement status, and learned-gate status. For the real config, look for:
+
+```text
+Learned reliability gate  enabled (W_sem/W_char/W_ignore ...)
+```
+
+The learned gate is trainable and checkpointed under `reliability_gate_state`.
+It consumes cached `P_M3/C_M3/P_C/C_C/B_C`, teacher disagreement, and detached
+student uncertainty after warmup. The gate emits:
+
+- `W_sem`: CineMA semantic/ROI KD reliability.
+- `W_char`: MedSAM2 boundary/shape KD reliability.
+- `W_ignore`: conflict/uncertain regions where teacher KD is downweighted.
+
+Training logs include `train_W_sem_mean`, `train_W_char_mean`,
+`train_W_ignore_mean`, `train_gate_entropy_mean`, and
+`train_student_uncertainty_mean`.
 
 Equivalent explicit command:
 
@@ -371,6 +391,22 @@ dual_teacher_kd:
 
 This downweights fused KD where MedSAM2 and CineMA disagree while keeping
 field KD, CineMA boundary KD, and spectral KD unchanged.
+
+Learned reliability gate config:
+
+```yaml
+dual_teacher_kd:
+  learned_gate:
+    enabled: true
+    hidden_channels: 32
+    use_student_uncertainty: true
+    student_uncertainty_warmup_epochs: 10
+    use_ignore: true
+    lambda_gate_prior: 0.05
+    gate_prior_decay_epochs: 30
+    lambda_ignore_sparsity: 0.01
+    lambda_gate_tv: 0.001
+```
 
 ## CineMA-Only Real Teacher Test
 

@@ -4,7 +4,7 @@ data_root: preprocessed_data/ACDC
 output_root: weights
 save_dir: weights/s3r_dual_teacher_real_100ep
 device: cuda
-epochs: 100
+epochs: 200
 batch_size: 4
 image_size: 224
 input_mode: 25d
@@ -51,3 +51,16 @@ dual_teacher_kd:
   fused_kd_weight_mode: agreement
   fused_kd_min_weight: 0.10
   fused_kd_agreement_power: 1.0
+
+  learned_gate:
+    enabled: true
+    hidden_channels: 32
+    use_student_uncertainty: true
+    student_uncertainty_warmup_epochs: 10
+    use_ignore: true
+    lr: null
+    weight_decay: 0.0
+    lambda_gate_prior: 0.05
+    gate_prior_decay_epochs: 30
+    lambda_ignore_sparsity: 0.01
+    lambda_gate_tv: 0.001

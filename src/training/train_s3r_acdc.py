@@ -38,6 +38,7 @@ from models.s3r.losses import boundary_map_from_mask
 from models.s3r.metrics import HAS_SCIPY, segmentation_surface_metrics
 from models.s3r.spectral_utils import build_radial_frequency_masks
 from losses.agreement_kd import compute_dual_teacher_kd_loss
+from losses.reliability_gate import StudentAwareReliabilityGate
 from teachers import CineMATeacher, MedSAM2Teacher, TeacherLoadError
 from teachers.teacher_utils import load_dual_teacher_cache, resize_teacher_output_to_student
 
@@ -225,6 +226,18 @@ def apply_config_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
     kd.setdefault("disable_spectral_kd", False)
     kd.setdefault("disable_agreement_weighting", False)
     kd.setdefault("use_vanilla_kd_only", False)
+    learned_gate = kd.setdefault("learned_gate", {})
+    learned_gate.setdefault("enabled", False)
+    learned_gate.setdefault("hidden_channels", 32)
+    learned_gate.setdefault("use_student_uncertainty", True)
+    learned_gate.setdefault("student_uncertainty_warmup_epochs", 10)
+    learned_gate.setdefault("use_ignore", True)
+    learned_gate.setdefault("lr", None)
+    learned_gate.setdefault("weight_decay", 0.0)
+    learned_gate.setdefault("lambda_gate_prior", 0.0)
+    learned_gate.setdefault("gate_prior_decay_epochs", 0)
+    learned_gate.setdefault("lambda_ignore_sparsity", 0.0)
+    learned_gate.setdefault("lambda_gate_tv", 0.0)
 
     loss_weights = cfg.setdefault("loss_weights", {})
     loss_weights.setdefault("boundary_bce", 0.50)
@@ -480,6 +493,57 @@ def build_model(cfg: dict[str, Any]) -> nn.Module:
     )
 
 
+def build_reliability_gate(cfg: dict[str, Any], device: torch.device) -> StudentAwareReliabilityGate | None:
+    kd = cfg.get("dual_teacher_kd", {})
+    gate_cfg = kd.get("learned_gate", {}) if isinstance(kd.get("learned_gate", {}), dict) else {}
+    if not (bool(kd.get("enabled", False)) and bool(gate_cfg.get("enabled", False))):
+        return None
+    return StudentAwareReliabilityGate(
+        num_classes=int(cfg["num_classes"]),
+        hidden_channels=int(gate_cfg.get("hidden_channels", 32)),
+        use_student_uncertainty=bool(gate_cfg.get("use_student_uncertainty", True)),
+        student_uncertainty_warmup_epochs=int(gate_cfg.get("student_uncertainty_warmup_epochs", 10)),
+        use_ignore=bool(gate_cfg.get("use_ignore", True)),
+    ).to(device)
+
+
+def build_optimizer(model: nn.Module, reliability_gate: nn.Module | None, cfg: dict[str, Any]) -> torch.optim.Optimizer:
+    lr = float(cfg["lr"])
+    weight_decay = float(cfg["weight_decay"])
+    param_groups: list[dict[str, Any]] = [{"params": list(model.parameters()), "lr": lr, "weight_decay": weight_decay}]
+    if reliability_gate is not None:
+        gate_cfg = cfg.get("dual_teacher_kd", {}).get("learned_gate", {})
+        gate_lr = gate_cfg.get("lr")
+        param_groups.append(
+            {
+                "params": list(reliability_gate.parameters()),
+                "lr": lr if gate_lr in (None, "") else float(gate_lr),
+                "weight_decay": float(gate_cfg.get("weight_decay", 0.0) or 0.0),
+            }
+        )
+    return torch.optim.AdamW(param_groups)
+
+
+def build_checkpoint_payload(
+    epoch: int,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    cfg: dict[str, Any],
+    reliability_gate: nn.Module | None,
+    **extra: Any,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "epoch": int(epoch),
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "config": cfg,
+    }
+    if reliability_gate is not None:
+        payload["reliability_gate_state"] = reliability_gate.state_dict()
+    payload.update(extra)
+    return payload
+
+
 def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -511,6 +575,17 @@ def estimate_model_profile(model: nn.Module, cfg: dict[str, Any], device: torch.
         model.train(was_training)
         if device.type == "cuda":
             torch.cuda.empty_cache()
+    return profile
+
+
+def augment_profile_with_reliability_gate(profile: dict[str, Any], gate: StudentAwareReliabilityGate | None, cfg: dict[str, Any]) -> dict[str, Any]:
+    profile = dict(profile)
+    gate_params = count_parameters(gate) if gate is not None else 0
+    gate_flops = gate.estimate_flops(int(cfg["image_size"])) if gate is not None else 0
+    profile["reliability_gate_params"] = gate_params
+    profile["reliability_gate_flops"] = gate_flops
+    profile["total_trainable_params"] = int(profile.get("params") or 0) + int(gate_params)
+    profile["total_trainable_flops"] = (int(profile["flops"]) + int(gate_flops)) if profile.get("flops") is not None else None
     return profile
 
 
@@ -597,6 +672,10 @@ def format_pre_epoch_config_table(
     spec_active = not bool(kd.get("disable_spectral_kd", False)) and float(kd.get("lambda_spec", 0.0) or 0.0) > 0
     agreement_active = not bool(kd.get("disable_agreement_weighting", False))
     fused_mode = str(kd.get("fused_kd_weight_mode", "none") or "none").lower()
+    learned_gate = kd.get("learned_gate", {}) if isinstance(kd.get("learned_gate", {}), dict) else {}
+    learned_gate_active = bool(learned_gate.get("enabled", False))
+    gate_params = int(profile.get("reliability_gate_params") or 0)
+    gate_flops = profile.get("reliability_gate_flops")
 
     rows.extend(
         [
@@ -618,6 +697,17 @@ def format_pre_epoch_config_table(
                 _status(
                     fuse_active and fused_mode == "agreement",
                     f"mode={fused_mode} min={kd.get('fused_kd_min_weight')} power={kd.get('fused_kd_agreement_power')}",
+                ),
+            ),
+            (
+                "Learned reliability gate",
+                _status(
+                    learned_gate_active,
+                    "W_sem/W_char/W_ignore "
+                    f"hidden={learned_gate.get('hidden_channels')} "
+                    f"warmup={learned_gate.get('student_uncertainty_warmup_epochs')} "
+                    f"params={format_count(gate_params, 1e3, 'K')} "
+                    f"GFLOPs={format_count(gate_flops, 1e9, '')}",
                 ),
             ),
             ("Field KD", _status(field_active, f"lambda={kd.get('lambda_field')}")),
@@ -983,7 +1073,11 @@ def print_epoch_report(epoch: int, train_metrics: dict[str, float], val_metrics:
             f"fuse_w_range=[{train_metrics.get('fuse_weight_min', math.nan):.4f},"
             f"{train_metrics.get('fuse_weight_max', math.nan):.4f}] "
             f"W_M3={train_metrics.get('W_M3_mean', math.nan):.4f} "
-            f"W_C={train_metrics.get('W_C_mean', math.nan):.4f}"
+            f"W_C={train_metrics.get('W_C_mean', math.nan):.4f} "
+            f"W_sem={train_metrics.get('W_sem_mean', math.nan):.4f} "
+            f"W_char={train_metrics.get('W_char_mean', math.nan):.4f} "
+            f"W_ignore={train_metrics.get('W_ignore_mean', math.nan):.4f} "
+            f"gate_H={train_metrics.get('gate_entropy_mean', math.nan):.4f}"
         )
     print(format_class_metric_table(val_metrics))
 
@@ -1035,6 +1129,13 @@ def finish_wandb(run: Any) -> None:
         run.finish()
 
 
+def _optimizer_parameters(optimizer: torch.optim.Optimizer) -> list[Tensor]:
+    params: list[Tensor] = []
+    for group in optimizer.param_groups:
+        params.extend(p for p in group.get("params", []) if isinstance(p, Tensor))
+    return params
+
+
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -1083,7 +1184,14 @@ def run_epoch(
                 should_eval_teacher = eval_every <= 0 or batch_idx % eval_every == 0
                 if should_eval_teacher:
                     teacher_outputs = load_or_compute_teacher_outputs(kd_context, batch, tuple(outputs["seg_logits"].shape), device)
-                    kd_loss, kd_parts, _ = compute_dual_teacher_kd_loss(outputs, teacher_outputs, masks, cfg)
+                    kd_loss, kd_parts, _ = compute_dual_teacher_kd_loss(
+                        outputs,
+                        teacher_outputs,
+                        masks,
+                        cfg,
+                        reliability_gate=kd_context.get("reliability_gate"),
+                        epoch=epoch,
+                    )
                     loss = loss + kd_loss
                     parts.update(kd_parts)
                     parts["loss"] = float(loss.detach().cpu())
@@ -1102,13 +1210,22 @@ def run_epoch(
                             "fuse_weight_max": math.nan,
                             "W_M3_mean": math.nan,
                             "W_C_mean": math.nan,
+                            "reliability_gate_active": math.nan,
+                            "W_sem_mean": math.nan,
+                            "W_char_mean": math.nan,
+                            "W_ignore_mean": math.nan,
+                            "gate_entropy_mean": math.nan,
+                            "student_uncertainty_mean": math.nan,
+                            "loss_gate_prior": 0.0,
+                            "loss_gate_ignore": 0.0,
+                            "loss_gate_tv": 0.0,
                         }
                     )
             if training:
                 loss.backward()
                 grad_clip = float(cfg.get("grad_clip", 0.0) or 0.0)
                 if grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    torch.nn.utils.clip_grad_norm_(_optimizer_parameters(optimizer), grad_clip)
                 optimizer.step()
             progress.set_postfix(loss=f"{parts['loss']:.4f}")
 
@@ -1324,6 +1441,11 @@ def plot_training_curves(run_dir: Path, rows: list[dict[str, Any]], ssr_rows: li
             "train_fuse_weight_max",
             "train_W_M3_mean",
             "train_W_C_mean",
+            "train_W_sem_mean",
+            "train_W_char_mean",
+            "train_W_ignore_mean",
+            "train_gate_entropy_mean",
+            "train_student_uncertainty_mean",
         ]
         if any(key in rows[0] for key in kd_weight_keys):
             plt.figure(figsize=(8, 4.5))
@@ -1444,11 +1566,14 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
 
     train_loader, val_loader, split_info = make_loaders(cfg)
     model = build_model(cfg).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg["lr"]), weight_decay=float(cfg["weight_decay"]))
-    profile = estimate_model_profile(model, cfg, device)
+    reliability_gate = build_reliability_gate(cfg, device)
+    optimizer = build_optimizer(model, reliability_gate, cfg)
+    profile = augment_profile_with_reliability_gate(estimate_model_profile(model, cfg, device), reliability_gate, cfg)
     model_params = int(profile["params"])
     wandb_run = init_wandb(cfg, run_dir)
     teacher_kd_context = build_teacher_kd_context(cfg, device)
+    if teacher_kd_context is not None:
+        teacher_kd_context["reliability_gate"] = reliability_gate
 
     with open(run_dir / "config_resolved.yaml", "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
@@ -1504,6 +1629,15 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
             "train_fuse_weight_max": train_metrics.get("fuse_weight_max", math.nan),
             "train_W_M3_mean": train_metrics.get("W_M3_mean", math.nan),
             "train_W_C_mean": train_metrics.get("W_C_mean", math.nan),
+            "train_reliability_gate_active": train_metrics.get("reliability_gate_active", math.nan),
+            "train_W_sem_mean": train_metrics.get("W_sem_mean", math.nan),
+            "train_W_char_mean": train_metrics.get("W_char_mean", math.nan),
+            "train_W_ignore_mean": train_metrics.get("W_ignore_mean", math.nan),
+            "train_gate_entropy_mean": train_metrics.get("gate_entropy_mean", math.nan),
+            "train_student_uncertainty_mean": train_metrics.get("student_uncertainty_mean", math.nan),
+            "train_loss_gate_prior": train_metrics.get("loss_gate_prior", math.nan),
+            "train_loss_gate_ignore": train_metrics.get("loss_gate_ignore", math.nan),
+            "train_loss_gate_tv": train_metrics.get("loss_gate_tv", math.nan),
             "val_boundary_bce": val_metrics["boundary_bce"],
             "val_boundary_dice": val_metrics["boundary_dice"],
             "val_bfreq": val_metrics["boundary_frequency"],
@@ -1528,12 +1662,12 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
             best_val = val_metrics["fg_dice"]
             best_epoch = epoch
             best_row = dict(row)
-            torch.save({"epoch": epoch, "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(), "val_fg_mean": best_val, "config": cfg}, run_dir / "best_model.pt")
+            torch.save(build_checkpoint_payload(epoch, model, optimizer, cfg, reliability_gate, val_fg_mean=best_val), run_dir / "best_model.pt")
         hd95_value = float(row.get("val_hd95_fg_mean", math.nan))
         if math.isfinite(hd95_value) and hd95_value < best_hd95:
             best_hd95 = hd95_value
             best_hd95_epoch = epoch
-            torch.save({"epoch": epoch, "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(), "val_hd95_fg_mean": best_hd95, "config": cfg}, run_dir / "best_hd95_model.pt")
+            torch.save(build_checkpoint_payload(epoch, model, optimizer, cfg, reliability_gate, val_hd95_fg_mean=best_hd95), run_dir / "best_hd95_model.pt")
 
         write_csv(run_dir / "training_log.csv", training_rows)
         write_csv(run_dir / "ssr_logs.csv", ssr_rows, ["epoch", "split", "block", "metric", "band", "value"])
@@ -1541,7 +1675,7 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
         print_epoch_report(epoch, train_metrics, val_metrics)
         log_wandb_metrics(wandb_run, epoch, train_metrics, val_metrics, {"lr": optimizer.param_groups[0]["lr"]})
 
-    torch.save({"epoch": int(cfg["epochs"]), "model_state": model.state_dict(), "optimizer_state": optimizer.state_dict(), "config": cfg}, run_dir / "final_model.pt")
+    torch.save(build_checkpoint_payload(int(cfg["epochs"]), model, optimizer, cfg, reliability_gate), run_dir / "final_model.pt")
     plot_training_curves(run_dir, training_rows, ssr_rows)
     save_prediction_grid(model, train_loader, device, run_dir / "train_predictions.png")
     save_prediction_grid(model, val_loader, device, run_dir / "val_predictions.png")
@@ -1575,8 +1709,12 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
         "epochs": int(cfg["epochs"]),
         "model_parameter_count": model_params,
         "model_parameter_millions": model_params / 1e6,
+        "reliability_gate_parameter_count": int(profile.get("reliability_gate_params") or 0),
+        "total_trainable_parameter_count": int(profile.get("total_trainable_params") or model_params),
         "model_flops": profile.get("flops"),
         "model_gflops": profile.get("gflops"),
+        "reliability_gate_flops": profile.get("reliability_gate_flops"),
+        "total_trainable_flops": profile.get("total_trainable_flops"),
         "model_profile_backend": profile.get("profile_backend"),
         "train_slices": split_info["train_slices"],
         "val_slices": split_info["val_slices"],

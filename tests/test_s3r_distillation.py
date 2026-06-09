@@ -22,6 +22,7 @@ from src.distillation.teacher_targets import (
     teacher_agreement_weight,
 )
 from src.losses.agreement_kd import agreement_aware_fusion, compute_dual_teacher_kd_loss
+from src.losses.reliability_gate import StudentAwareReliabilityGate
 from src.teachers import CineMATeacher, MedSAM2Teacher
 
 
@@ -154,6 +155,97 @@ def test_agreement_aware_fusion_normalizes_and_bounds_weights() -> None:
         assert torch.isfinite(fusion[key]).all()
         assert float(fusion[key].min()) >= 0.0
         assert float(fusion[key].max()) <= 1.0
+
+
+def test_student_aware_reliability_gate_outputs_spatial_weights() -> None:
+    B, C, H, W = 2, 4, 12, 12
+    gate = StudentAwareReliabilityGate(
+        num_classes=C,
+        hidden_channels=8,
+        use_student_uncertainty=True,
+        student_uncertainty_warmup_epochs=2,
+        use_ignore=True,
+    )
+    p_m3 = torch.softmax(torch.randn(B, C, H, W), dim=1)
+    p_c = torch.softmax(torch.randn(B, C, H, W), dim=1)
+    student_logits = torch.randn(B, C, H, W)
+
+    warm = gate(
+        student_logits=student_logits,
+        p_semantic_teacher=p_m3,
+        p_cinema=p_c,
+        c_semantic_teacher=torch.rand(B, 1, H, W),
+        c_cinema=torch.rand(B, 1, H, W),
+        teacher_boundary=torch.rand(B, 1, H, W),
+        agreement=torch.rand(B, 1, H, W),
+        epoch=1,
+    )
+    active = gate(
+        student_logits=student_logits,
+        p_semantic_teacher=p_m3,
+        p_cinema=p_c,
+        c_semantic_teacher=torch.rand(B, 1, H, W),
+        c_cinema=torch.rand(B, 1, H, W),
+        teacher_boundary=torch.rand(B, 1, H, W),
+        agreement=torch.rand(B, 1, H, W),
+        epoch=3,
+    )
+
+    for output in (warm, active):
+        assert output["W_sem"].shape == (B, 1, H, W)
+        assert output["W_char"].shape == (B, 1, H, W)
+        assert output["W_ignore"].shape == (B, 1, H, W)
+        total = output["W_sem"] + output["W_char"] + output["W_ignore"]
+        assert torch.allclose(total, torch.ones_like(total), atol=1e-5)
+        assert torch.isfinite(output["gate_entropy"]).all()
+
+    assert warm["student_uncertainty_enabled"] is False
+    assert active["student_uncertainty_enabled"] is True
+
+
+def test_learned_reliability_gate_kd_backpropagates_to_gate_not_teachers() -> None:
+    B, C, H, W = 1, 4, 10, 10
+    gate = StudentAwareReliabilityGate(num_classes=C, hidden_channels=8, use_ignore=True)
+    gt_mask = torch.zeros(B, H, W, dtype=torch.long)
+    p_m3 = torch.softmax(torch.randn(B, C, H, W), dim=1).requires_grad_()
+    p_c = torch.softmax(torch.randn(B, C, H, W), dim=1).requires_grad_()
+    teacher = {
+        "P_M3": p_m3,
+        "C_M3": torch.ones(B, 1, H, W, requires_grad=True),
+        "P_C": p_c,
+        "C_C": torch.ones(B, 1, H, W, requires_grad=True),
+        "B_C": torch.rand(B, 1, H, W, requires_grad=True),
+    }
+    student = {"seg_logits": torch.randn(B, C, H, W, requires_grad=True)}
+
+    loss, parts, fusion = compute_dual_teacher_kd_loss(
+        student,
+        teacher,
+        gt_mask,
+        {
+            "dual_teacher_kd": {
+                "learned_gate": {"enabled": True},
+                "lambda_field": 0.3,
+                "lambda_cine_boundary": 0.5,
+                "lambda_fuse": 0.5,
+                "lambda_spec": 0.0,
+                "disable_spectral_kd": True,
+            }
+        },
+        reliability_gate=gate,
+        epoch=3,
+    )
+
+    loss.backward()
+
+    gate_grad = sum(p.grad.abs().sum().item() for p in gate.parameters() if p.grad is not None)
+    assert gate_grad > 0.0
+    assert p_m3.grad is None
+    assert p_c.grad is None
+    assert "W_sem_mean" in parts and "W_char_mean" in parts and "W_ignore_mean" in parts
+    assert fusion["W_sem"].shape == (B, 1, H, W)
+    assert fusion["W_char"].shape == (B, 1, H, W)
+    assert fusion["W_ignore"].shape == (B, 1, H, W)
 
 
 def test_dual_teacher_kd_loss_and_stub_outputs_are_finite() -> None:
@@ -373,6 +465,9 @@ def test_real_dual_teacher_config_uses_real_teacher_cache() -> None:
     assert kd["teacher_amp"] is True
     assert kd["teacher_amp_dtype"] == "bfloat16"
     assert kd["fused_kd_weight_mode"] == "agreement"
+    assert kd["learned_gate"]["enabled"] is True
+    assert kd["learned_gate"]["use_student_uncertainty"] is True
+    assert kd["learned_gate"]["use_ignore"] is True
 
 
 def test_train_config_defaults_teacher_amp_dtype() -> None:
@@ -419,6 +514,7 @@ def test_pre_epoch_config_table_reports_cached_dual_teacher_and_profile() -> Non
     assert "P_C/C_C/B_C" in table
     assert "Agreement weighting" in table and "enabled" in table
     assert "Fused KD gate" in table and "agreement" in table
+    assert "Learned reliability gate" in table and "W_sem/W_char/W_ignore" in table
 
 
 def test_agreement_gated_fused_kd_reports_bounded_weight() -> None:

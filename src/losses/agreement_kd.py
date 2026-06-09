@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -14,6 +15,7 @@ from src.teachers.teacher_utils import (
     one_hot_to_boundary,
     resize_teacher_output_to_student,
 )
+from .reliability_gate import gate_regularization_loss
 
 
 _MISSING = object()
@@ -163,6 +165,9 @@ def compute_dual_teacher_kd_loss(
     teacher_outputs: dict[str, Tensor],
     gt_mask: Tensor,
     cfg: dict[str, Any],
+    *,
+    reliability_gate: torch.nn.Module | None = None,
+    epoch: int | None = None,
 ) -> tuple[Tensor, dict[str, float], dict[str, Tensor]]:
     """Compute optional dual-teacher KD terms and return scalar loss + logs."""
     logits = student_outputs["seg_logits"]
@@ -229,12 +234,71 @@ def compute_dual_teacher_kd_loss(
     teacher_disagreement = (1.0 - fusion["agreement"].to(device=device, dtype=logits.dtype)).clamp(0.0, 1.0)
 
     T = float(kd.get("kd_temperature", 4.0))
-    field = zero if bool(kd.get("disable_field_kd", False)) else segmentation_field_kd_loss(logits, p_m3, fusion["W_interior"], T)
-    cine_boundary = zero if bool(kd.get("disable_cine_boundary_kd", False)) else cinema_boundary_kd_loss(logits, p_c, fusion["W_boundary"], T)
+    learned_gate_cfg = kd.get("learned_gate", {}) if isinstance(kd.get("learned_gate", {}), dict) else {}
+    learned_gate_enabled = bool(learned_gate_cfg.get("enabled", False))
+    gate_reg = zero
+    gate_parts: dict[str, float] = {
+        "reliability_gate_active": 0.0,
+        "W_sem_mean": math.nan,
+        "W_char_mean": math.nan,
+        "W_ignore_mean": math.nan,
+        "gate_entropy_mean": math.nan,
+        "student_uncertainty_mean": math.nan,
+        "loss_gate_prior": 0.0,
+        "loss_gate_ignore": 0.0,
+        "loss_gate_tv": 0.0,
+    }
+
+    if learned_gate_enabled:
+        if reliability_gate is None:
+            raise ValueError("dual_teacher_kd.learned_gate.enabled=true requires a reliability_gate module")
+        medsam2_boundary = one_hot_to_boundary(p_m3.detach(), mode="soft", dilation=3)
+        gate_output = reliability_gate(
+            student_logits=logits,
+            p_semantic_teacher=p_m3,
+            p_cinema=p_c,
+            c_semantic_teacher=c_m3,
+            c_cinema=c_c,
+            teacher_boundary=medsam2_boundary,
+            agreement=fusion["agreement"],
+            epoch=epoch,
+        )
+        w_sem = gate_output["W_sem"].to(device=device, dtype=logits.dtype)
+        w_char = gate_output["W_char"].to(device=device, dtype=logits.dtype)
+        w_ignore = gate_output["W_ignore"].to(device=device, dtype=logits.dtype)
+        if not isinstance(w_sem, Tensor) or not isinstance(w_char, Tensor) or not isinstance(w_ignore, Tensor):
+            raise TypeError("reliability_gate must return Tensor values for W_sem, W_char, and W_ignore")
+        fusion["W_sem"] = w_sem.detach()
+        fusion["W_char"] = w_char.detach()
+        fusion["W_ignore"] = w_ignore.detach()
+        fusion["P_F"] = normalize_probs(w_sem * p_c + w_char * p_m3).detach()
+        fusion["W_fuse"] = (1.0 - w_ignore).clamp(0.0, 1.0).detach()
+        gate_reg, reg_parts = gate_regularization_loss(gate_output, fusion, learned_gate_cfg, epoch=epoch)
+        gate_parts.update(reg_parts)
+        gate_parts.update(
+            {
+                "reliability_gate_active": 1.0,
+                "W_sem_mean": float(w_sem.mean().detach().cpu()),
+                "W_char_mean": float(w_char.mean().detach().cpu()),
+                "W_ignore_mean": float(w_ignore.mean().detach().cpu()),
+                "gate_entropy_mean": float(gate_output["gate_entropy"].mean().detach().cpu()),
+                "student_uncertainty_mean": float(gate_output["student_entropy"].mean().detach().cpu()),
+            }
+        )
+        field_weight = w_char
+        cine_weight = w_sem
+        fuse_loss_weight = (1.0 - w_ignore).clamp(0.0, 1.0)
+    else:
+        field_weight = fusion["W_interior"]
+        cine_weight = fusion["W_boundary"]
+        fuse_loss_weight = fuse_weight if fuse_weight_mode == "agreement" else None
+
+    field = zero if bool(kd.get("disable_field_kd", False)) else segmentation_field_kd_loss(logits, p_m3, field_weight, T)
+    cine_boundary = zero if bool(kd.get("disable_cine_boundary_kd", False)) else cinema_boundary_kd_loss(logits, p_c, cine_weight, T)
     fuse = (
         zero
         if bool(kd.get("disable_fused_kd", False))
-        else fused_kd_loss(logits, fusion["P_F"], T, weight=fuse_weight if fuse_weight_mode == "agreement" else None)
+        else fused_kd_loss(logits, fusion["P_F"], T, weight=fuse_loss_weight)
     )
     spec = zero
     if not bool(kd.get("disable_spectral_kd", False)) and float(kd.get("lambda_spec", 0.05)) > 0:
@@ -251,6 +315,7 @@ def compute_dual_teacher_kd_loss(
         + float(kd.get("lambda_cine_boundary", 0.5)) * cine_boundary
         + float(kd.get("lambda_fuse", 0.5)) * fuse
         + float(kd.get("lambda_spec", 0.05)) * spec
+        + gate_reg
     )
     parts = {
         "loss_field": float(field.detach().cpu()),
@@ -266,6 +331,7 @@ def compute_dual_teacher_kd_loss(
         "W_M3_mean": float(fusion["W_M3"].mean().detach().cpu()),
         "W_C_mean": float(fusion["W_C"].mean().detach().cpu()),
     }
+    parts.update(gate_parts)
     return total, parts, fusion
 
 
