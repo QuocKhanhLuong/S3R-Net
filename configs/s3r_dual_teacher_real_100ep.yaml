@@ -1,0 +1,53 @@
+model: s3r_net
+run_name: s3r_dual_teacher_real_100ep
+data_root: preprocessed_data/ACDC
+output_root: weights
+save_dir: weights/s3r_dual_teacher_real_100ep
+device: cuda
+epochs: 100
+batch_size: 8
+image_size: 224
+input_mode: 25d
+in_channels: 5
+base_channels: 48
+num_workers: 4
+use_tqdm: true
+
+wandb:
+  enabled: false
+  project: s3r-acdc
+  run_name: s3r_dual_teacher_real_100ep
+
+dual_teacher_kd:
+  enabled: true
+  teacher_stub: false
+  medsam2_stub: false
+  cinema_stub: false
+  teacher_cache_dir: teacher_cache/acdc_real
+  strict_teacher_cache: true
+
+  medsam2_repo_path: external/MedSAM2
+  medsam2_ckpt_dir: checkpoints/teachers/medsam2
+  medsam2_ckpt: MedSAM2_latest.pt
+  medsam2_config: configs/sam2.1_hiera_t512.yaml
+  medsam2_prompt_mode: gt_box
+
+  cinema_repo_path: external/CineMA
+  cinema_ckpt_dir: checkpoints/teachers/cinema
+  cinema_ckpt: checkpoints/teachers/cinema/finetuned/segmentation/acdc_sax/acdc_sax_0.safetensors
+  cinema_config: checkpoints/teachers/cinema/finetuned/segmentation/acdc_sax/config.yaml
+  cinema_dataset: acdc
+  cinema_view: sax
+  cinema_seed: 0
+
+  teacher_device: cuda
+  teacher_amp: true
+  teacher_amp_dtype: bfloat16
+  kd_temperature: 4.0
+  lambda_field: 0.3
+  lambda_cine_boundary: 0.5
+  lambda_fuse: 0.5
+  lambda_spec: 0.05
+  fused_kd_weight_mode: agreement
+  fused_kd_min_weight: 0.10
+  fused_kd_agreement_power: 1.0

@@ -143,38 +143,46 @@ Distillation uses the same compact metric table and supports:
 
 ## Agreement-Aware Dual-Teacher KD
 
-Optional training-time KD can use frozen MedSAM2 and CineMA teachers:
+Optional training-time KD can use frozen MedSAM2 and CineMA teachers. For the
+real dual-teacher path, do not pass any `--teacher_stub` flag.
 
 ```bash
-bash scripts/setup_teachers.sh medsam2
+bash scripts/setup_teachers.sh both
 python scripts/download_teachers.py \
-  --teacher medsam2 \
+  --teacher both \
   --medsam2_repo wanglab/MedSAM2 \
   --medsam2_filename MedSAM2_latest.pt \
   --output_dir checkpoints/teachers
 ```
 
+Precompute real teacher outputs once:
+
+```bash
+TORCH_CUDNN_SDPA_ENABLED=1 python scripts/precompute_teacher_outputs.py \
+  --teacher both \
+  --data_dir preprocessed_data/ACDC \
+  --output_dir teacher_cache/acdc_real \
+  --medsam2_repo_path external/MedSAM2 \
+  --medsam2_ckpt_dir checkpoints/teachers/medsam2 \
+  --medsam2_ckpt MedSAM2_latest.pt \
+  --medsam2_config configs/sam2.1_hiera_t512.yaml \
+  --medsam2_prompt_mode gt_box \
+  --cinema_repo_path external/CineMA \
+  --cinema_ckpt_dir checkpoints/teachers/cinema \
+  --cinema_ckpt checkpoints/teachers/cinema/finetuned/segmentation/acdc_sax/acdc_sax_0.safetensors \
+  --cinema_config checkpoints/teachers/cinema/finetuned/segmentation/acdc_sax/config.yaml \
+  --input_mode 25d \
+  --num_classes 4 \
+  --device cuda \
+  --teacher_amp \
+  --teacher_amp_dtype bfloat16
+```
+
+Train S3R-Net for 100 epochs using the strict real cache:
+
 ```bash
 python src/training/train_s3r_acdc.py \
-  --model s3r_net \
-  --data_dir preprocessed_data/ACDC/training \
-  --image_size 224 \
-  --epochs 250 \
-  --batch_size 8 \
-  --input_mode 25d \
-  --in_channels 5 \
-  --base_channels 48 \
-  --use_dual_teacher_kd \
-  --teacher_cache_dir teacher_cache/acdc \
-  --kd_temperature 4.0 \
-  --lambda_field 0.3 \
-  --lambda_cine_boundary 0.5 \
-  --lambda_fuse 0.5 \
-  --lambda_spec 0.05 \
-  --save_dir weights/s3r_dual_teacher_kd \
-  --wandb \
-  --wandb_project s3r-acdc \
-  --wandb_run_name s3r_net_dual_teacher_kd
+  --config configs/s3r_dual_teacher_real_100ep.yaml
 ```
 
 Debug without real teacher weights:

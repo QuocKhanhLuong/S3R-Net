@@ -222,13 +222,19 @@ teacher-free.
 
 ```bash
 python scripts/precompute_teacher_outputs.py \
-  --data_dir preprocessed_data/ACDC/training \
-  --output_dir teacher_cache/acdc \
+  --teacher both \
+  --data_dir preprocessed_data/ACDC \
+  --output_dir teacher_cache/acdc_real \
+  --medsam2_repo_path external/MedSAM2 \
   --medsam2_ckpt_dir checkpoints/teachers/medsam2 \
   --medsam2_ckpt MedSAM2_latest.pt \
   --medsam2_config configs/sam2.1_hiera_t512.yaml \
-  --cinema_ckpt_dir checkpoints/teachers/cinema \
   --medsam2_prompt_mode gt_box \
+  --cinema_repo_path external/CineMA \
+  --cinema_ckpt_dir checkpoints/teachers/cinema \
+  --cinema_ckpt checkpoints/teachers/cinema/finetuned/segmentation/acdc_sax/acdc_sax_0.safetensors \
+  --cinema_config checkpoints/teachers/cinema/finetuned/segmentation/acdc_sax/config.yaml \
+  --input_mode 25d \
   --num_classes 4 \
   --device cuda \
   --teacher_amp \
@@ -238,7 +244,7 @@ python scripts/precompute_teacher_outputs.py \
 Cache files are `.pt` per sample:
 
 ```text
-teacher_cache/acdc/<case_id>_<slice_idx>.pt
+teacher_cache/acdc_real/<case_id>_<slice_idx>.pt
 ```
 
 Each item stores `P_M3`, `C_M3`, `P_C`, `C_C`, `B_C`, and metadata. The `M3`
@@ -255,8 +261,8 @@ starts:
 ```bash
 TORCH_CUDNN_SDPA_ENABLED=1 python scripts/precompute_teacher_outputs.py \
   --teacher both \
-  --data_dir preprocessed_data/ACDC/training \
-  --output_dir teacher_cache/acdc \
+  --data_dir preprocessed_data/ACDC \
+  --output_dir teacher_cache/acdc_real \
   --medsam2_repo_path external/MedSAM2 \
   --medsam2_ckpt_dir checkpoints/teachers/medsam2 \
   --medsam2_ckpt MedSAM2_latest.pt \
@@ -278,29 +284,54 @@ You can also force float16 with `--teacher_amp_dtype float16`.
 
 ## Train
 
-S3R full with cached dual-teacher KD:
+Real 100-epoch dual-teacher KD from the precomputed MedSAM2 + CineMA cache:
+
+```bash
+python src/training/train_s3r_acdc.py \
+  --config configs/s3r_dual_teacher_real_100ep.yaml
+```
+
+This config is intentionally strict: `teacher_stub`, `medsam2_stub`, and
+`cinema_stub` are all `false`, and `strict_teacher_cache` is `true`. If a cache
+item is missing, training fails instead of silently falling back to online or
+stub teachers.
+
+Equivalent explicit command:
 
 ```bash
 python src/training/train_s3r_acdc.py \
   --model s3r_net \
-  --data_dir preprocessed_data/ACDC/training \
+  --data_dir preprocessed_data/ACDC \
   --image_size 224 \
-  --epochs 250 \
+  --epochs 100 \
   --batch_size 8 \
   --input_mode 25d \
   --in_channels 5 \
   --base_channels 48 \
   --use_dual_teacher_kd \
-  --teacher_cache_dir teacher_cache/acdc \
+  --teacher_cache_dir teacher_cache/acdc_real \
+  --strict_teacher_cache \
+  --medsam2_repo_path external/MedSAM2 \
+  --medsam2_ckpt_dir checkpoints/teachers/medsam2 \
+  --medsam2_ckpt MedSAM2_latest.pt \
+  --medsam2_config configs/sam2.1_hiera_t512.yaml \
+  --medsam2_prompt_mode gt_box \
+  --cinema_repo_path external/CineMA \
+  --cinema_ckpt_dir checkpoints/teachers/cinema \
+  --cinema_ckpt checkpoints/teachers/cinema/finetuned/segmentation/acdc_sax/acdc_sax_0.safetensors \
+  --cinema_config checkpoints/teachers/cinema/finetuned/segmentation/acdc_sax/config.yaml \
+  --teacher_amp \
+  --teacher_amp_dtype bfloat16 \
   --kd_temperature 4.0 \
   --lambda_field 0.3 \
   --lambda_cine_boundary 0.5 \
   --lambda_fuse 0.5 \
   --lambda_spec 0.05 \
-  --save_dir weights/s3r_dual_teacher_kd \
+  --fused_kd_weight_mode agreement \
+  --save_dir weights/s3r_dual_teacher_real_100ep \
   --wandb \
   --wandb_project s3r-acdc \
-  --wandb_run_name s3r_net_dual_teacher_kd
+  --wandb_run_name s3r_dual_teacher_real_100ep
 ```
 
 Stub training smoke:

@@ -345,6 +345,44 @@ def test_teacher_scripts_resolve_amp_dtype() -> None:
             raise AssertionError("unsupported teacher AMP dtype should fail")
 
 
+def test_real_dual_teacher_config_uses_real_teacher_cache() -> None:
+    spec = importlib.util.spec_from_file_location("train_s3r_acdc_real_config", "src/training/train_s3r_acdc.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    cfg = module.apply_config_defaults(module.load_config("configs/s3r_dual_teacher_real_100ep.yaml"))
+    kd = cfg["dual_teacher_kd"]
+
+    assert cfg["epochs"] == 100
+    assert cfg["input_mode"] == "25d"
+    assert cfg["in_channels"] == 5
+    assert kd["enabled"] is True
+    assert kd["teacher_stub"] is False
+    assert kd["medsam2_stub"] is False
+    assert kd["cinema_stub"] is False
+    assert kd["teacher_cache_dir"] == "teacher_cache/acdc_real"
+    assert kd["strict_teacher_cache"] is True
+    assert kd["medsam2_repo_path"] == "external/MedSAM2"
+    assert kd["medsam2_ckpt"] == "MedSAM2_latest.pt"
+    assert kd["cinema_ckpt"].endswith("acdc_sax_0.safetensors")
+    assert kd["teacher_amp"] is True
+    assert kd["teacher_amp_dtype"] == "bfloat16"
+    assert kd["fused_kd_weight_mode"] == "agreement"
+
+
+def test_train_config_defaults_teacher_amp_dtype() -> None:
+    spec = importlib.util.spec_from_file_location("train_s3r_acdc_amp_dtype", "src/training/train_s3r_acdc.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    cfg = module.apply_config_defaults({"dual_teacher_kd": {"enabled": True}})
+
+    assert cfg["dual_teacher_kd"]["teacher_amp_dtype"] == "bfloat16"
+    assert module._resolve_teacher_amp_dtype("float16", torch.device("cpu")) is torch.float16
+
+
 def test_agreement_gated_fused_kd_reports_bounded_weight() -> None:
     gt_mask = torch.zeros(1, 8, 8, dtype=torch.long)
     p_m3 = torch.zeros(1, 4, 8, 8)

@@ -107,6 +107,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fused_kd_min_weight", type=float, default=None)
     parser.add_argument("--fused_kd_agreement_power", type=float, default=None)
     parser.add_argument("--teacher_amp", action="store_true", default=None)
+    parser.add_argument("--teacher_amp_dtype", choices=["bfloat16", "float16"], default=None)
     parser.add_argument("--teacher_device", default=None)
     parser.add_argument("--teacher_eval_every", type=int, default=None)
     parser.add_argument("--disable_field_kd", action="store_true", default=None)
@@ -215,6 +216,7 @@ def apply_config_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
     kd.setdefault("fused_kd_min_weight", 0.10)
     kd.setdefault("fused_kd_agreement_power", 1.0)
     kd.setdefault("teacher_amp", False)
+    kd.setdefault("teacher_amp_dtype", "bfloat16")
     kd.setdefault("teacher_device", "cuda")
     kd.setdefault("teacher_eval_every", 0)
     kd.setdefault("disable_field_kd", False)
@@ -357,6 +359,7 @@ def apply_variant_and_cli(cfg: dict[str, Any], args: argparse.Namespace) -> dict
         ("fused_kd_min_weight", "fused_kd_min_weight"),
         ("fused_kd_agreement_power", "fused_kd_agreement_power"),
         ("teacher_amp", "teacher_amp"),
+        ("teacher_amp_dtype", "teacher_amp_dtype"),
         ("teacher_device", "teacher_device"),
         ("teacher_eval_every", "teacher_eval_every"),
         ("disable_field_kd", "disable_field_kd"),
@@ -396,6 +399,17 @@ def resolve_device(name: str) -> torch.device:
         print("Requested CUDA but it is not available; using CPU.")
         return torch.device("cpu")
     return torch.device(name)
+
+
+def _resolve_teacher_amp_dtype(name: str, device: torch.device) -> torch.dtype:
+    if name == "float16":
+        return torch.float16
+    if name == "bfloat16":
+        if device.type == "cuda" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+            print("Requested bfloat16 teacher AMP but this CUDA device does not support BF16; using float16.")
+            return torch.float16
+        return torch.bfloat16
+    raise ValueError(f"Unsupported teacher AMP dtype: {name}")
 
 
 def make_loaders(cfg: dict[str, Any]) -> tuple[DataLoader, DataLoader, dict[str, Any]]:
@@ -710,7 +724,7 @@ def format_teacher_kd_startup_log(kd: dict[str, Any], context: dict[str, Any], c
         "Dual-teacher KD enabled:",
         f"  source={'cache:'+str(cache_dir) if cache_dir else 'online teachers'}",
         f"  teacher_stub={bool(kd.get('teacher_stub', False))} teacher_device={context.get('teacher_device')} "
-        f"teacher_amp={bool(kd.get('teacher_amp', False))}",
+        f"teacher_amp={bool(kd.get('teacher_amp', False))} teacher_amp_dtype={kd.get('teacher_amp_dtype')}",
         f"  T={kd.get('kd_temperature')} lambda_field={kd.get('lambda_field')} "
         f"lambda_cine_boundary={kd.get('lambda_cine_boundary')} lambda_fuse={kd.get('lambda_fuse')} "
         f"lambda_spec={kd.get('lambda_spec')}",
@@ -763,7 +777,8 @@ def load_or_compute_teacher_outputs(
         for key, value in batch.items()
     }
     amp_enabled = bool(kd_context["cfg"].get("teacher_amp", False)) and teacher_device.type == "cuda"
-    with torch.no_grad(), torch.autocast(device_type=teacher_device.type, enabled=amp_enabled):
+    amp_dtype = _resolve_teacher_amp_dtype(str(kd_context["cfg"].get("teacher_amp_dtype", "bfloat16")), teacher_device)
+    with torch.no_grad(), torch.autocast(device_type=teacher_device.type, dtype=amp_dtype, enabled=amp_enabled):
         out_m3 = m3(teacher_batch) if m3 is not None else None
         out_c = cinema(teacher_batch)
     outputs = {
