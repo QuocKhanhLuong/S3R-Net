@@ -325,6 +325,26 @@ def test_teacher_loading_preview_skips_when_matplotlib_missing(tmp_path: Path) -
     assert not (tmp_path / "preview.png").exists()
 
 
+def test_teacher_scripts_resolve_amp_dtype() -> None:
+    for script_path, module_name in (
+        ("scripts/test_teacher_loading.py", "test_teacher_loading_script_amp"),
+        ("scripts/precompute_teacher_outputs.py", "precompute_teacher_outputs_script_amp"),
+    ):
+        spec = importlib.util.spec_from_file_location(module_name, script_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        assert module._resolve_amp_dtype("bfloat16", torch.device("cpu")) is torch.bfloat16
+        assert module._resolve_amp_dtype("float16", torch.device("cpu")) is torch.float16
+        try:
+            module._resolve_amp_dtype("float32", torch.device("cpu"))
+        except ValueError as exc:
+            assert "Unsupported teacher AMP dtype" in str(exc)
+        else:
+            raise AssertionError("unsupported teacher AMP dtype should fail")
+
+
 def test_agreement_gated_fused_kd_reports_bounded_weight() -> None:
     gt_mask = torch.zeros(1, 8, 8, dtype=torch.long)
     p_m3 = torch.zeros(1, 4, 8, 8)

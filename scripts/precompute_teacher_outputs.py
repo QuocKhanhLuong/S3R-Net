@@ -50,6 +50,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher_stub", action="store_true")
     parser.add_argument("--medsam2_stub", action="store_true")
     parser.add_argument("--cinema_stub", action="store_true")
+    parser.add_argument("--teacher_amp", action="store_true", help="Enable CUDA autocast around teacher inference.")
+    parser.add_argument(
+        "--teacher_amp_dtype",
+        choices=["bfloat16", "float16"],
+        default="bfloat16",
+        help="CUDA autocast dtype for teacher inference when --teacher_amp is enabled.",
+    )
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--medical_sam3_repo_path", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--medical_sam3_ckpt_dir", default=None, help=argparse.SUPPRESS)
@@ -62,6 +69,8 @@ def main() -> None:
     args = parse_args()
     normalize_medsam2_args(args)
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
+    amp_enabled = bool(args.teacher_amp) and device.type == "cuda"
+    amp_dtype = _resolve_amp_dtype(args.teacher_amp_dtype, device)
     dataset = ACDCSSRSliceDataset(
         args.data_dir,
         input_mode=args.input_mode,
@@ -106,8 +115,9 @@ def main() -> None:
     saved = 0
     for batch in tqdm(loader, desc="precompute teachers"):
         batch = _move_batch(batch, device)
-        out_m3 = m3(batch) if m3 is not None else None
-        out_c = cinema(batch) if cinema is not None else None
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+            out_m3 = m3(batch) if m3 is not None else None
+            out_c = cinema(batch) if cinema is not None else None
         case_id = str(batch["case_id"][0])
         slice_idx = int(batch["slice_idx"][0])
         payload: dict[str, Any] = {
@@ -122,13 +132,13 @@ def main() -> None:
             },
         }
         if out_m3 is not None:
-            payload["P_M3"] = out_m3["probs"][0].detach().cpu()
-            payload["C_M3"] = out_m3["confidence"][0].detach().cpu()
+            payload["P_M3"] = out_m3["probs"][0].detach().float().cpu()
+            payload["C_M3"] = out_m3["confidence"][0].detach().float().cpu()
             payload["metadata"]["shape"] = list(out_m3["probs"].shape[-2:])
         if out_c is not None:
-            payload["P_C"] = out_c["probs"][0].detach().cpu()
-            payload["C_C"] = out_c["confidence"][0].detach().cpu()
-            payload["B_C"] = out_c.get("boundary", torch.zeros_like(out_c["confidence"]))[0].detach().cpu()
+            payload["P_C"] = out_c["probs"][0].detach().float().cpu()
+            payload["C_C"] = out_c["confidence"][0].detach().float().cpu()
+            payload["B_C"] = out_c.get("boundary", torch.zeros_like(out_c["confidence"]))[0].detach().float().cpu()
             payload["metadata"]["shape"] = list(out_c["probs"].shape[-2:])
         save_dual_teacher_cache(output_dir, case_id, slice_idx, payload)
         saved += 1
@@ -167,6 +177,17 @@ def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     for key, value in batch.items():
         out[key] = value.to(device, non_blocking=True) if torch.is_tensor(value) else value
     return out
+
+
+def _resolve_amp_dtype(name: str, device: torch.device) -> torch.dtype:
+    if name == "float16":
+        return torch.float16
+    if name == "bfloat16":
+        if device.type == "cuda" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+            print("Requested bfloat16 teacher AMP but this CUDA device does not support BF16; using float16.")
+            return torch.float16
+        return torch.bfloat16
+    raise ValueError(f"Unsupported teacher AMP dtype: {name}")
 
 
 if __name__ == "__main__":

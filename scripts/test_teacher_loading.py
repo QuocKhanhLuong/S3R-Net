@@ -46,6 +46,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--input_mode", choices=["2d", "25d"], default="2d")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--teacher_amp", action="store_true", help="Enable CUDA autocast around teacher inference.")
+    parser.add_argument(
+        "--teacher_amp_dtype",
+        choices=["bfloat16", "float16"],
+        default="bfloat16",
+        help="CUDA autocast dtype for teacher inference when --teacher_amp is enabled.",
+    )
     parser.add_argument("--output", default="debug_outputs/teacher_kd_preview.png")
     parser.add_argument("--skip_preview", action="store_true")
     parser.add_argument("--medical_sam3_repo_path", default=None, help=argparse.SUPPRESS)
@@ -68,6 +75,8 @@ def main() -> None:
     )
     batch = next(iter(DataLoader(dataset, batch_size=1, shuffle=False)))
     batch = _move_batch(batch, device)
+    amp_enabled = bool(args.teacher_amp) and device.type == "cuda"
+    amp_dtype = _resolve_amp_dtype(args.teacher_amp_dtype, device)
     out_m3 = None
     out_c = None
     if args.teacher in {"medsam2", "both"}:
@@ -82,7 +91,8 @@ def main() -> None:
             prompt_mode=args.medsam2_prompt_mode,
             teacher_stub=args.teacher_stub or args.medsam2_stub,
         )
-        out_m3 = m3(batch)
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+            out_m3 = m3(batch)
         print("MedSAM2 probs:", tuple(out_m3["probs"].shape))
         print("MedSAM2 confidence:", tuple(out_m3["confidence"].shape))
     if args.teacher in {"cinema", "both"}:
@@ -100,7 +110,8 @@ def main() -> None:
             class_map=args.cinema_class_map or None,
             teacher_stub=args.teacher_stub or args.cinema_stub,
         )
-        out_c = cinema(batch)
+        with torch.no_grad(), torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+            out_c = cinema(batch)
         print("CineMA probs:", tuple(out_c["probs"].shape))
         print("CineMA boundary:", tuple(out_c.get("boundary", torch.empty(0)).shape))
     if out_m3 is None and out_c is None:
@@ -140,6 +151,17 @@ def normalize_medsam2_args(args: argparse.Namespace) -> None:
 
 def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return {key: value.to(device, non_blocking=True) if torch.is_tensor(value) else value for key, value in batch.items()}
+
+
+def _resolve_amp_dtype(name: str, device: torch.device) -> torch.dtype:
+    if name == "float16":
+        return torch.float16
+    if name == "bfloat16":
+        if device.type == "cuda" and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+            print("Requested bfloat16 teacher AMP but this CUDA device does not support BF16; using float16.")
+            return torch.float16
+        return torch.bfloat16
+    raise ValueError(f"Unsupported teacher AMP dtype: {name}")
 
 
 def save_preview(

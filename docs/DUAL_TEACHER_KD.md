@@ -209,6 +209,8 @@ python scripts/test_teacher_loading.py \
   --input_mode 25d \
   --num_classes 4 \
   --device cuda \
+  --teacher_amp \
+  --teacher_amp_dtype bfloat16 \
   --skip_preview
 ```
 
@@ -228,7 +230,9 @@ python scripts/precompute_teacher_outputs.py \
   --cinema_ckpt_dir checkpoints/teachers/cinema \
   --medsam2_prompt_mode gt_box \
   --num_classes 4 \
-  --device cuda
+  --device cuda \
+  --teacher_amp \
+  --teacher_amp_dtype bfloat16
 ```
 
 Cache files are `.pt` per sample:
@@ -244,6 +248,33 @@ outputs.
 `--medsam2_config` is passed to MedSAM2 Hydra as a config name under the
 external repo's `sam2/` package. Use `configs/sam2.1_hiera_t512.yaml`, not an
 absolute `/path/to/external/MedSAM2/...` config path.
+
+For fewer MedSAM2 attention fallback warnings, enable cuDNN SDPA before Python
+starts:
+
+```bash
+TORCH_CUDNN_SDPA_ENABLED=1 python scripts/precompute_teacher_outputs.py \
+  --teacher both \
+  --data_dir preprocessed_data/ACDC/training \
+  --output_dir teacher_cache/acdc \
+  --medsam2_repo_path external/MedSAM2 \
+  --medsam2_ckpt_dir checkpoints/teachers/medsam2 \
+  --medsam2_ckpt MedSAM2_latest.pt \
+  --medsam2_config configs/sam2.1_hiera_t512.yaml \
+  --medsam2_prompt_mode gt_box \
+  --cinema_repo_path external/CineMA \
+  --cinema_ckpt_dir checkpoints/teachers/cinema \
+  --cinema_ckpt checkpoints/teachers/cinema/finetuned/segmentation/acdc_sax/acdc_sax_0.safetensors \
+  --cinema_config checkpoints/teachers/cinema/finetuned/segmentation/acdc_sax/config.yaml \
+  --input_mode 25d \
+  --num_classes 4 \
+  --device cuda \
+  --teacher_amp \
+  --teacher_amp_dtype bfloat16
+```
+
+If BF16 is not supported on the server GPU, the scripts fall back to float16.
+You can also force float16 with `--teacher_amp_dtype float16`.
 
 ## Train
 
@@ -354,6 +385,17 @@ python src/training/train_s3r_acdc.py \
 The trainer prints the effective KD lambdas, fused-KD weight mode, per-epoch KD
 components, `teacher_disagreement_mean`, `fuse_weight_mean`, and fuse-weight
 range; it saves `kd_loss_components.png` plus `kd_agreement_weights.png`.
+
+## MedSAM2 Runtime Warnings
+
+If MedSAM2 prints `probs` and `confidence`, the teacher loaded and produced a
+valid output. The common SAM2/PyTorch warnings have different meanings:
+
+| Warning family | Meaning | Action |
+| --- | --- | --- |
+| Flash, memory-efficient, or cuDNN SDPA kernel not used | PyTorch could not use a fused attention kernel and fell back to a slower math kernel. | Use `--teacher_amp --teacher_amp_dtype bfloat16` or `float16`. Optionally prefix the command with `TORCH_CUDNN_SDPA_ENABLED=1`. |
+| `Expected query, key and value ... Half, BFloat16 ... got float` | The attention path is running in float32, so fused kernels are not eligible. | Enable teacher AMP for smoke/cache generation. |
+| `sam2/_C.so: GLIBC_2.32 not found`; skipping post-processing | The optional SAM2 C/CUDA extension was built against a newer system libc than the host. SAM2 can still run, but hole-filling post-processing is skipped. | Ignore for KD cache unless hole-filling becomes important. To remove the warning, rebuild MedSAM2/SAM2 on the same server or install it with `SAM2_BUILD_CUDA=0`. |
 
 ## Ablations
 
