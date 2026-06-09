@@ -47,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input_mode", choices=["2d", "25d"], default="2d")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output", default="debug_outputs/teacher_kd_preview.png")
+    parser.add_argument("--skip_preview", action="store_true")
     parser.add_argument("--medical_sam3_repo_path", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--medical_sam3_ckpt_dir", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--medical_sam3_prompt_mode", default=None, help=argparse.SUPPRESS)
@@ -117,8 +118,10 @@ def main() -> None:
         print("Agreement:", tuple(fusion["agreement"].shape))
     else:
         fusion = None
-    save_preview(batch, out_m3, out_c, fusion, Path(args.output))
-    print(f"Saved preview: {args.output}")
+    if args.skip_preview:
+        print("Skipped preview: --skip_preview")
+    elif save_preview(batch, out_m3, out_c, fusion, Path(args.output)):
+        print(f"Saved preview: {args.output}")
 
 
 def normalize_medsam2_args(args: argparse.Namespace) -> None:
@@ -145,13 +148,14 @@ def save_preview(
     out_c: dict[str, Any] | None,
     fusion: dict[str, torch.Tensor] | None,
     path: Path,
-) -> None:
+) -> bool:
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-    except ImportError as exc:
-        raise SystemExit("matplotlib is required to save teacher preview") from exc
+    except ImportError:
+        print("matplotlib is not installed; skipping teacher preview.")
+        return False
 
     path.parent.mkdir(parents=True, exist_ok=True)
     image = batch["image"][0, batch["image"].shape[1] // 2].detach().cpu()
@@ -184,6 +188,7 @@ def save_preview(
     plt.tight_layout()
     plt.savefig(path, dpi=160)
     plt.close(fig)
+    return True
 
 
 if __name__ == "__main__":

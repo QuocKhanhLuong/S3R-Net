@@ -208,7 +208,8 @@ python scripts/test_teacher_loading.py \
   --medsam2_prompt_mode gt_box \
   --input_mode 25d \
   --num_classes 4 \
-  --device cuda
+  --device cuda \
+  --skip_preview
 ```
 
 The MedSAM2 adapter uses GT-derived class boxes during teacher-cache

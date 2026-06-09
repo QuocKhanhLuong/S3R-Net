@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import math
 import os
+import builtins
+import importlib.util
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -294,6 +297,32 @@ def test_medsam2_config_resolver_returns_hydra_config_name(tmp_path: Path) -> No
         config_path=repo / "configs" / "sam2.1_hiera_t512.yaml",
     )
     assert legacy._resolve_config_name() == "configs/sam2.1_hiera_t512.yaml"
+
+
+def test_teacher_loading_preview_skips_when_matplotlib_missing(tmp_path: Path) -> None:
+    spec = importlib.util.spec_from_file_location("test_teacher_loading_script", "scripts/test_teacher_loading.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    batch = {
+        "image": torch.randn(1, 1, 16, 16),
+        "mask": torch.zeros(1, 16, 16, dtype=torch.long),
+    }
+    original_import = builtins.__import__
+
+    def fake_import(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "matplotlib" or name.startswith("matplotlib."):
+            raise ImportError("missing matplotlib")
+        return original_import(name, *args, **kwargs)
+
+    builtins.__import__ = fake_import
+    try:
+        saved = module.save_preview(batch, None, None, None, tmp_path / "preview.png")
+    finally:
+        builtins.__import__ = original_import
+
+    assert saved is False
+    assert not (tmp_path / "preview.png").exists()
 
 
 def test_agreement_gated_fused_kd_reports_bounded_weight() -> None:
