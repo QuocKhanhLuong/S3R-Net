@@ -284,7 +284,8 @@ You can also force float16 with `--teacher_amp_dtype float16`.
 
 ## Train
 
-Real 100-epoch dual-teacher KD from the precomputed MedSAM2 + CineMA cache:
+Real 100-epoch dual-teacher KD from the precomputed MedSAM2 + CineMA cache.
+The config uses batch size 4 and logs to W&B project `s3r-acdc`:
 
 ```bash
 python src/training/train_s3r_acdc.py \
@@ -304,7 +305,7 @@ python src/training/train_s3r_acdc.py \
   --data_dir preprocessed_data/ACDC \
   --image_size 224 \
   --epochs 100 \
-  --batch_size 8 \
+  --batch_size 4 \
   --input_mode 25d \
   --in_channels 5 \
   --base_channels 48 \

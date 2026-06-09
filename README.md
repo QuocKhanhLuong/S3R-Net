@@ -178,7 +178,8 @@ TORCH_CUDNN_SDPA_ENABLED=1 python scripts/precompute_teacher_outputs.py \
   --teacher_amp_dtype bfloat16
 ```
 
-Train S3R-Net for 100 epochs using the strict real cache:
+Train S3R-Net for 100 epochs using the strict real cache. The config uses
+batch size 4 and logs to W&B project `s3r-acdc`:
 
 ```bash
 python src/training/train_s3r_acdc.py \

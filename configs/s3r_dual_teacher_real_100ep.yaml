@@ -5,7 +5,7 @@ output_root: weights
 save_dir: weights/s3r_dual_teacher_real_100ep
 device: cuda
 epochs: 100
-batch_size: 8
+batch_size: 4
 image_size: 224
 input_mode: 25d
 in_channels: 5
@@ -14,7 +14,7 @@ num_workers: 4
 use_tqdm: true
 
 wandb:
-  enabled: false
+  enabled: true
   project: s3r-acdc
   run_name: s3r_dual_teacher_real_100ep
 

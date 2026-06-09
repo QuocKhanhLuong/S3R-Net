@@ -355,8 +355,12 @@ def test_real_dual_teacher_config_uses_real_teacher_cache() -> None:
     kd = cfg["dual_teacher_kd"]
 
     assert cfg["epochs"] == 100
+    assert cfg["batch_size"] == 4
     assert cfg["input_mode"] == "25d"
     assert cfg["in_channels"] == 5
+    assert cfg["wandb"]["enabled"] is True
+    assert cfg["wandb"]["project"] == "s3r-acdc"
+    assert cfg["wandb"]["run_name"] == "s3r_dual_teacher_real_100ep"
     assert kd["enabled"] is True
     assert kd["teacher_stub"] is False
     assert kd["medsam2_stub"] is False
