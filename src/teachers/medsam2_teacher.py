@@ -131,12 +131,12 @@ class MedSAM2Teacher(FrozenSegmentationTeacher):
 
     def _resolve_checkpoint(self) -> Path:
         if self.explicit_checkpoint_path is not None:
-            explicit = self.explicit_checkpoint_path.expanduser()
-            if not explicit.is_absolute() and self.checkpoint_dir is not None:
-                explicit = self.checkpoint_dir / explicit
-            if not explicit.exists():
-                raise TeacherLoadError(f"MedSAM2 checkpoint not found: {explicit}")
-            return explicit.resolve()
+            candidates = _explicit_checkpoint_candidates(self.explicit_checkpoint_path, self.checkpoint_dir)
+            for explicit in candidates:
+                if explicit.exists():
+                    return explicit.resolve()
+            tried = ", ".join(str(path) for path in candidates)
+            raise TeacherLoadError(f"MedSAM2 checkpoint not found. Tried: {tried}")
         if self.checkpoint_dir is None or not self.checkpoint_dir.exists():
             raise TeacherLoadError(
                 f"MedSAM2 checkpoint directory not found: {self.checkpoint_dir}. "
@@ -272,6 +272,28 @@ def _select_checkpoint(candidates: list[Path]) -> Path:
         )
 
     return sorted(candidates, key=score)[0]
+
+
+def _explicit_checkpoint_candidates(checkpoint_path: Path, checkpoint_dir: Path | None) -> list[Path]:
+    explicit = checkpoint_path.expanduser()
+    if explicit.is_absolute():
+        return [explicit]
+    candidates = [explicit]
+    if checkpoint_dir is not None:
+        base = checkpoint_dir.expanduser()
+        if explicit.parent == Path("."):
+            candidates.append(base / explicit)
+        elif not _is_relative_to(explicit, base):
+            candidates.append(base / explicit.name)
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(path)
+    return deduped
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:

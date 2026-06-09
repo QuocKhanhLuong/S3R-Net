@@ -203,7 +203,7 @@ python scripts/test_teacher_loading.py \
   --data_dir preprocessed_data/ACDC \
   --medsam2_repo_path external/MedSAM2 \
   --medsam2_ckpt_dir checkpoints/teachers/medsam2 \
-  --medsam2_ckpt checkpoints/teachers/medsam2/MedSAM2_latest.pt \
+  --medsam2_ckpt MedSAM2_latest.pt \
   --medsam2_prompt_mode gt_box \
   --input_mode 25d \
   --num_classes 4 \
@@ -221,7 +221,7 @@ python scripts/precompute_teacher_outputs.py \
   --data_dir preprocessed_data/ACDC/training \
   --output_dir teacher_cache/acdc \
   --medsam2_ckpt_dir checkpoints/teachers/medsam2 \
-  --medsam2_ckpt checkpoints/teachers/medsam2/MedSAM2_latest.pt \
+  --medsam2_ckpt MedSAM2_latest.pt \
   --cinema_ckpt_dir checkpoints/teachers/cinema \
   --medsam2_prompt_mode gt_box \
   --num_classes 4 \

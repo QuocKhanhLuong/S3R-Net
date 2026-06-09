@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 
 import numpy as np
@@ -244,6 +245,26 @@ def build_sam2_video_predictor_npz(cfg, checkpoint):
     assert torch.isfinite(out["probs"]).all()
     assert float(out["probs"][:, 1].max()) > 0.0
     assert out["meta"]["teacher"] == "medsam2"
+
+
+def test_medsam2_checkpoint_resolver_accepts_project_relative_checkpoint(tmp_path: Path) -> None:
+    ckpt_dir = tmp_path / "checkpoints" / "teachers" / "medsam2"
+    ckpt_dir.mkdir(parents=True)
+    ckpt = ckpt_dir / "MedSAM2_latest.pt"
+    ckpt.write_bytes(b"fake")
+    cwd = Path.cwd()
+    os.chdir(tmp_path)
+    try:
+        teacher = MedSAM2Teacher(
+            "checkpoints/teachers/medsam2",
+            device="cpu",
+            num_classes=4,
+            checkpoint_path="checkpoints/teachers/medsam2/MedSAM2_latest.pt",
+        )
+
+        assert teacher._resolve_checkpoint() == ckpt.resolve()
+    finally:
+        os.chdir(cwd)
 
 
 def test_agreement_gated_fused_kd_reports_bounded_weight() -> None:
