@@ -183,6 +183,9 @@ def test_medsam2_real_adapter_binds_video_predictor(tmp_path: Path) -> None:
     sam2_dir = repo / "sam2"
     sam2_dir.mkdir(parents=True)
     (sam2_dir / "__init__.py").write_text("", encoding="utf-8")
+    cfg = sam2_dir / "configs" / "sam2.1_hiera_t512.yaml"
+    cfg.parent.mkdir()
+    cfg.write_text("model: {}\n", encoding="utf-8")
     ckpt_dir = tmp_path / "checkpoints"
     ckpt_dir.mkdir()
     (ckpt_dir / "older.pt").write_bytes(b"old")
@@ -216,6 +219,7 @@ class FakePredictor:
         pass
 
 def build_sam2_video_predictor_npz(cfg, checkpoint):
+    assert cfg == 'configs/sam2.1_hiera_t512.yaml'
     return FakePredictor(cfg, checkpoint)
 """,
         encoding="utf-8",
@@ -231,7 +235,7 @@ def build_sam2_video_predictor_npz(cfg, checkpoint):
         num_classes=4,
         image_size=16,
         repo_path=repo,
-        config_path=repo / "configs" / "sam2.1_hiera_t512.yaml",
+        config_path=cfg,
         teacher_stub=False,
     )
 
@@ -239,6 +243,7 @@ def build_sam2_video_predictor_npz(cfg, checkpoint):
 
     assert teacher.checkpoint_path is not None
     assert teacher.checkpoint_path.name == "MedSAM2_latest.pt"
+    assert teacher.config_name == "configs/sam2.1_hiera_t512.yaml"
     assert out["probs"].shape == (1, 4, 16, 16)
     assert out["confidence"].shape == (1, 1, 16, 16)
     assert out["boundary"].shape == (1, 1, 16, 16)
@@ -265,6 +270,30 @@ def test_medsam2_checkpoint_resolver_accepts_project_relative_checkpoint(tmp_pat
         assert teacher._resolve_checkpoint() == ckpt.resolve()
     finally:
         os.chdir(cwd)
+
+
+def test_medsam2_config_resolver_returns_hydra_config_name(tmp_path: Path) -> None:
+    repo = tmp_path / "MedSAM2"
+    cfg = repo / "sam2" / "configs" / "sam2.1_hiera_t512.yaml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("model: {}\n", encoding="utf-8")
+    teacher = MedSAM2Teacher(
+        tmp_path,
+        device="cpu",
+        num_classes=4,
+        repo_path=repo,
+        config_path=cfg,
+    )
+
+    assert teacher._resolve_config_name() == "configs/sam2.1_hiera_t512.yaml"
+    legacy = MedSAM2Teacher(
+        tmp_path,
+        device="cpu",
+        num_classes=4,
+        repo_path=repo,
+        config_path=repo / "configs" / "sam2.1_hiera_t512.yaml",
+    )
+    assert legacy._resolve_config_name() == "configs/sam2.1_hiera_t512.yaml"
 
 
 def test_agreement_gated_fused_kd_reports_bounded_weight() -> None:

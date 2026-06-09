@@ -46,6 +46,7 @@ class MedSAM2Teacher(FrozenSegmentationTeacher):
         self.predictor_image_size = int(kwargs.get("predictor_image_size", 512))
         self.checkpoint_candidates: list[Path] = []
         self.checkpoint_path: Path | None = None
+        self.config_name: str | None = None
         self.predictor: Any | None = None
 
     def load(self) -> "MedSAM2Teacher":
@@ -59,8 +60,9 @@ class MedSAM2Teacher(FrozenSegmentationTeacher):
             )
         self.checkpoint_path = self._resolve_checkpoint()
         builder = self._load_predictor_builder()
+        self.config_name = self._resolve_config_name()
         try:
-            self.predictor = builder(str(self._resolve_config_path()), str(self.checkpoint_path))
+            self.predictor = builder(self.config_name, str(self.checkpoint_path))
         except Exception as exc:  # pragma: no cover - depends on external repo
             raise TeacherLoadError(
                 "Could not initialize MedSAM2 predictor. Install the external repo dependencies, then retry:\n"
@@ -123,6 +125,7 @@ class MedSAM2Teacher(FrozenSegmentationTeacher):
                 "teacher_stub": False,
                 "teacher": "medsam2",
                 "checkpoint_path": str(self.checkpoint_path),
+                "config_name": self.config_name,
                 "config_path": str(self._resolve_config_path()),
                 "prompt_mode": self.prompt_mode,
                 "class_order": ["BG", "RV", "MYO", "LV"][: self.num_classes],
@@ -150,11 +153,34 @@ class MedSAM2Teacher(FrozenSegmentationTeacher):
             )
         return _select_checkpoint(self.checkpoint_candidates)
 
-    def _resolve_config_path(self) -> Path:
+    def _resolve_config_name(self) -> str:
         path = self.config_path.expanduser()
+        repo = self.repo_path.expanduser().resolve()
+        sam2_root = repo / "sam2"
+        candidates = [path]
         if path.is_absolute():
-            return path
-        return (self.repo_path / path).resolve()
+            candidates = [path.resolve()]
+        else:
+            candidates.extend([repo / path, sam2_root / path])
+        for candidate in candidates:
+            resolved = candidate.expanduser().resolve()
+            try:
+                return resolved.relative_to(sam2_root).as_posix()
+            except ValueError:
+                pass
+            try:
+                repo_relative = resolved.relative_to(repo)
+                if repo_relative.parts and repo_relative.parts[0] == "configs":
+                    return repo_relative.as_posix()
+            except ValueError:
+                continue
+        if path.parts and path.parts[0] == "sam2":
+            return Path(*path.parts[1:]).as_posix()
+        return path.as_posix()
+
+    def _resolve_config_path(self) -> Path:
+        config_name = self.config_name or self._resolve_config_name()
+        return (self.repo_path / "sam2" / config_name).resolve()
 
     def _load_predictor_builder(self) -> Any:
         repo = self.repo_path.resolve()

@@ -204,6 +204,7 @@ python scripts/test_teacher_loading.py \
   --medsam2_repo_path external/MedSAM2 \
   --medsam2_ckpt_dir checkpoints/teachers/medsam2 \
   --medsam2_ckpt MedSAM2_latest.pt \
+  --medsam2_config configs/sam2.1_hiera_t512.yaml \
   --medsam2_prompt_mode gt_box \
   --input_mode 25d \
   --num_classes 4 \
@@ -222,6 +223,7 @@ python scripts/precompute_teacher_outputs.py \
   --output_dir teacher_cache/acdc \
   --medsam2_ckpt_dir checkpoints/teachers/medsam2 \
   --medsam2_ckpt MedSAM2_latest.pt \
+  --medsam2_config configs/sam2.1_hiera_t512.yaml \
   --cinema_ckpt_dir checkpoints/teachers/cinema \
   --medsam2_prompt_mode gt_box \
   --num_classes 4 \
@@ -237,6 +239,10 @@ teacher_cache/acdc/<case_id>_<slice_idx>.pt
 Each item stores `P_M3`, `C_M3`, `P_C`, `C_C`, `B_C`, and metadata. The `M3`
 name is a legacy cache slot for the semantic teacher; it now contains MedSAM2
 outputs.
+
+`--medsam2_config` is passed to MedSAM2 Hydra as a config name under the
+external repo's `sam2/` package. Use `configs/sam2.1_hiera_t512.yaml`, not an
+absolute `/path/to/external/MedSAM2/...` config path.
 
 ## Train
 
