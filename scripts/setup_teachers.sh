@@ -6,14 +6,18 @@ cd "$ROOT_DIR"
 
 TEACHER="${1:-both}"
 case "$TEACHER" in
-  medical_sam3|cinema|both) ;;
+  medsam2|medical_sam3|cinema|both) ;;
   *)
-    echo "Usage: bash scripts/setup_teachers.sh [medical_sam3|cinema|both]"
+    echo "Usage: bash scripts/setup_teachers.sh [medsam2|cinema|both]"
     exit 2
     ;;
 esac
+if [ "$TEACHER" = "medical_sam3" ]; then
+  echo "medical_sam3 is deprecated; using medsam2."
+  TEACHER="medsam2"
+fi
 
-mkdir -p external checkpoints/teachers/medical_sam3 checkpoints/teachers/cinema
+mkdir -p external checkpoints/teachers/medsam2 checkpoints/teachers/cinema
 
 clone_teacher_repo() {
   local url="$1"
@@ -41,8 +45,8 @@ clone_teacher_repo() {
   git clone "$url" "$dest"
 }
 
-if [ "$TEACHER" = "medical_sam3" ] || [ "$TEACHER" = "both" ]; then
-  clone_teacher_repo https://github.com/AIM-Research-Lab/Medical-SAM3 external/Medical-SAM3
+if [ "$TEACHER" = "medsam2" ] || [ "$TEACHER" = "both" ]; then
+  clone_teacher_repo https://github.com/bowang-lab/MedSAM2 external/MedSAM2
 fi
 
 if [ "$TEACHER" = "cinema" ] || [ "$TEACHER" = "both" ]; then

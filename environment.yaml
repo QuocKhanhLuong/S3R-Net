@@ -20,8 +20,8 @@ dependencies:
   - pytorch-cuda=12.1
 
   # Scientific
-  # External teachers are picky: CineMA pins numpy==1.26.4 and timm==1.0.15,
-  # while SAM3 currently breaks under numpy 2.x in this integration path.
+  # External teachers are picky: CineMA pins numpy==1.26.4 and timm==1.0.15;
+  # keep these stable for CineMA + MedSAM2 cache generation.
   - numpy=1.26.4
   - scipy>=1.10
   - scikit-image>=0.21

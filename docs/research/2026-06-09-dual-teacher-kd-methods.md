@@ -7,7 +7,7 @@ Ngay: 2026-06-09
 Muc tieu la chon co che knowledge distillation (KD) thuc dung cho bai toan cardiac MRI segmentation trong SpecUMamba:
 
 - Student: S3R / S3R-Mini / S3R-Net.
-- Teacher A: Medical-SAM3, dung nhu semantic / prompt-driven field teacher.
+- Teacher A: MedSAM2, dung nhu semantic / prompt-driven field teacher.
 - Teacher B: CineMA, dung nhu cardiac anatomy / boundary / spectral teacher.
 - Rang buoc trien khai: teacher chi xuat hien luc train; inference cua S3R van teacher-free.
 
@@ -22,11 +22,11 @@ Boi canh hien tai cua repo:
 
 KD goc cua Hinton et al. dat nen tang cho viec day student bang soft targets va temperature scaling, voi muc tieu dua kien thuc cua ensemble/teacher lon vao student nho hon ma khong can teacher luc inference. Survey cua Gou et al. phan loai KD theo logits, features, relations, schemes va ung dung, cho thay output KD chi la mot lop trong tap co che rong hon.
 
-Voi multi-teacher KD, rui ro lon nhat la naive averaging: neu mot teacher sai hoac over-confident, student se hoc pseudo-target sai. CA-MKD de xuat gan reliability weight theo teacher prediction quality; dieu nay phu hop voi boi canh Medical-SAM3 va CineMA co domain strength khac nhau. Voi dense prediction/segmentation, cac paper nhu BPKD va KD cho medical image segmentation nhan manh rang body/interior va edge/boundary can tin hieu distillation khac nhau, thay vi doi xu moi pixel nhu nhau. FitNets, TransKD va GKD tu vision foundation models cho thay feature/intermediate KD co ich, nhung doi hoi projection/feature taps ro rang nen nen lam sau output/boundary KD.
+Voi multi-teacher KD, rui ro lon nhat la naive averaging: neu mot teacher sai hoac over-confident, student se hoc pseudo-target sai. CA-MKD de xuat gan reliability weight theo teacher prediction quality; dieu nay phu hop voi boi canh MedSAM2 va CineMA co domain strength khac nhau. Voi dense prediction/segmentation, cac paper nhu BPKD va KD cho medical image segmentation nhan manh rang body/interior va edge/boundary can tin hieu distillation khac nhau, thay vi doi xu moi pixel nhu nhau. FitNets, TransKD va GKD tu vision foundation models cho thay feature/intermediate KD co ich, nhung doi hoi projection/feature taps ro rang nen nen lam sau output/boundary KD.
 
 Rieng teacher trong repo:
 
-- Medical-SAM3 la prompt-driven medical segmentation foundation model duoc fine-tune tren nhieu medical datasets/modality, phu hop vai tro semantic field teacher nhung can canh giac prompt/GT-box leakage khi danh gia.
+- MedSAM2 la prompt-driven medical segmentation foundation model duoc fine-tune tren nhieu medical datasets/modality, phu hop vai tro semantic field teacher nhung can canh giac prompt/GT-box leakage khi danh gia.
 - CineMA la cine cardiac MRI foundation model, co model weights ACDC SAX segmentation tren Hugging Face, phu hop vai tro cardiac anatomy va boundary teacher.
 
 ## 3. Danh sach phuong phap va so sanh co che
@@ -34,10 +34,10 @@ Rieng teacher trong repo:
 | Phuong phap | Co che | Tin vao dieu gi | Uu diem | Rui ro | Phu hop voi repo |
 |---|---|---|---|---|---|
 | 1. Simple weighted sum | Tong loss co dinh: `L = L_seg + a*KD_M3 + b*KD_CineMA + c*KD_fuse + d*KD_spec`. | Tin vao lambda global. | De cai, de ablation, on dinh. | Khong biet vung nao teacher gioi/yeu; khong xu ly disagreement. | Nen giu lam baseline. Repo da co `lambda_field`, `lambda_cine_boundary`, `lambda_fuse`, `lambda_spec`. |
-| 2. Probability/logit averaging | Trung binh `P_M3` va `P_C`, hoac weighted average theo constant, roi KL student vao target fused. | Tin rang ensemble average tot hon tung teacher. | Don gian, dung logic KD ensemble goc. | Che dau xung dot; mot teacher sai co the keo fused target sai. | Khong nen lam co che chinh cho Medical-SAM3 + CineMA vi hai teacher co role khac nhau. |
+| 2. Probability/logit averaging | Trung binh `P_M3` va `P_C`, hoac weighted average theo constant, roi KL student vao target fused. | Tin rang ensemble average tot hon tung teacher. | Don gian, dung logic KD ensemble goc. | Che dau xung dot; mot teacher sai co the keo fused target sai. | Khong nen lam co che chinh cho MedSAM2 + CineMA vi hai teacher co role khac nhau. |
 | 3. Agreement-aware fusion | Tinh agreement theo `A = exp(-JS(P_M3, P_C))`; dung agreement trong fusion/weighting. | Teacher dong thuan thi pseudo-target dang tin hon. | Phu hop dual-teacher, co diagnostic tot. | Neu agreement chi nhan vao ca hai teacher weight truoc normalize, no co the khong giam loss o vung bat dong. | Da co mot phan. Nen sua theo huong agreement gate truc tiep `loss_fuse`. |
 | 4. Uncertainty/confidence weighting | Dung entropy/confidence map `C_M3`, `C_C`, calibration, hoac do gan voi GT trong train de gan reliability. | Teacher tu tin va/hoac gan GT thi dang tin hon. | Giam tac dong teacher uncertain; phu hop CA-MKD. | Confidence co the miscalibrated; over-confident wrong prediction van nguy hiem. | Nen dung ket hop voi agreement, khong dung mot minh. Repo da co `C_M3` va `C_C`. |
-| 5. Region/boundary routing | Medical-SAM3 supervise interior/semantic field; CineMA supervise boundary/anatomy. `W_interior = 1 - W_boundary`, `W_boundary` tu GT boundary band hoac CineMA boundary. | Moi teacher co chuyen mon theo region. | Rat hop cardiac segmentation: MYO/LV/RV loi nhieu o edge va contour. | Can boundary map dang tin; GT-derived boundary chi duoc dung luc train. | Rat phu hop. Repo da co `W_interior`, `W_boundary`, `cinema_boundary_kd_loss`. |
+| 5. Region/boundary routing | MedSAM2 supervise interior/semantic field; CineMA supervise boundary/anatomy. `W_interior = 1 - W_boundary`, `W_boundary` tu GT boundary band hoac CineMA boundary. | Moi teacher co chuyen mon theo region. | Rat hop cardiac segmentation: MYO/LV/RV loi nhieu o edge va contour. | Can boundary map dang tin; GT-derived boundary chi duoc dung luc train. | Rat phu hop. Repo da co `W_interior`, `W_boundary`, `cinema_boundary_kd_loss`. |
 | 6. Curriculum/schedule | Epoch dau train supervised hoac single-teacher; sau do ramp `lambda_field`, `lambda_cine_boundary`, `lambda_fuse`, `lambda_spec`. | Student can hoc anatomy co ban truoc khi nghe teacher phuc tap. | Giam noisy KD o dau training; de kiem soat. | Them schedule plumbing, can nhieu ablation. | Nen lam sau selective gate. |
 | 7. Cache-first/offline distillation | Precompute `P_M3`, `C_M3`, `P_C`, `C_C`, `B_C` va metadata; train tu cache. | Teacher outputs da duoc dong bang va kiem soat provenance. | Reproducible, tranh online OOM, hop long runs. | Cache drift theo split, image size, class order, checkpoint hash. | Bat buoc cho real dual-teacher experiment dai. Repo da co cache path. |
 | 8. Selective KD / disagreement gating | Downweight hoac skip fused KD khi teachers bat dong; supervised CE/Dice giu vai tro anchor. | Disagreement la tin hieu rui ro pseudo-label. | Tranh ep student hoc target trung binh sai; thay doi nho. | Threshold/power can tune; gate qua manh co the bo qua minority teacher dung. | Khuyen nghi implement ngay. No fix dung diem yeu hien tai cua `loss_fuse`. |
@@ -74,7 +74,7 @@ Ly do nen chon co che nay truoc:
 - Incremental: thay doi chinh nam trong `src/losses/agreement_kd.py` va config parsing trong `src/training/train_s3r_acdc.py`.
 - Khong doi teacher wrappers, dataset, cache schema bat buoc, hay inference path.
 - Bien agreement tu diagnostic thanh tin hieu training thuc su.
-- Tuong thich voi single-teacher fallback: khi Medical-SAM3 missing va repo fallback `p_m3 = p_c`, agreement se cao, nen gate khong vo tinh tat KD.
+- Tuong thich voi single-teacher fallback: khi MedSAM2 missing va repo fallback `p_m3 = p_c`, agreement se cao, nen gate khong vo tinh tat KD.
 - Co ablation ro: `fused_kd_weight_mode=none` vs `agreement`.
 
 Log nen them:
@@ -91,7 +91,7 @@ Log nen them:
 3. Region-routed KD without fused KD.
 4. Agreement-gated fused KD.
 5. Agreement-gated fused KD + spectral boundary KD.
-6. Cache-first agreement-gated KD voi real CineMA va Medical-SAM3 outputs.
+6. Cache-first agreement-gated KD voi real CineMA va MedSAM2 outputs.
 
 Metrics nen doc cung nhau:
 
@@ -127,7 +127,7 @@ Acceptance criteria:
 
 ## 7. Ket luan
 
-Trong boi canh SpecUMamba, dual-teacher KD khong nen la "average hai teacher". Co che hop ly nhat la xem Medical-SAM3 va CineMA nhu hai nguon chuyen mon: Medical-SAM3 cho semantic field/interior, CineMA cho anatomy/boundary, va teacher agreement/confidence la reliability gate. Buoc implement tot nhat luc nay la **agreement-gated fused KD** vi nho, do duoc, tuong thich code hien co, va truc tiep giam rui ro hoc pseudo-target sai o vung teachers bat dong.
+Trong boi canh SpecUMamba, dual-teacher KD khong nen la "average hai teacher". Co che hop ly nhat la xem MedSAM2 va CineMA nhu hai nguon chuyen mon: MedSAM2 cho semantic field/interior, CineMA cho anatomy/boundary, va teacher agreement/confidence la reliability gate. Buoc implement tot nhat luc nay la **agreement-gated fused KD** vi nho, do duoc, tuong thich code hien co, va truc tiep giam rui ro hoc pseudo-target sai o vung teachers bat dong.
 
 ## 8. Nguon tham khao
 
@@ -144,5 +144,6 @@ Trong boi canh SpecUMamba, dual-teacher KD khong nen la "average hai teacher". C
 - Fu, Y., Bai, W., Yi, W., Manisty, C., Bhuva, A. N., Treibel, T. A., Moon, J. C., Clarkson, M. J., Davies, R. H., & Hu, Y. (2025). A versatile foundation model for cine cardiac magnetic resonance image analysis tasks. https://arxiv.org/abs/2506.00679
 - CineMA GitHub repository. https://github.com/mathpluscode/CineMA
 - CineMA Hugging Face model card and ACDC SAX checkpoints. https://huggingface.co/mathpluscode/CineMA
-- Jiang, C., Ding, T., Song, C., Tu, J., Yan, Z., Shao, Y., Wang, Z., Shang, Y., Han, T., & Tian, Y. (2026). Medical SAM3: A Foundation Model for Universal Prompt-Driven Medical Image Segmentation. https://arxiv.org/abs/2601.10880
-- Medical-SAM3 GitHub repository. https://github.com/AIM-Research-Lab/Medical-SAM3
+- Ma, J., Yang, Z., Kim, S., Chen, B., Baharoon, M., Fallahpour, A., Asakereh, R., Lyu, H., & Wang, B. (2025). MedSAM2: Segment Anything in 3D Medical Images and Videos. https://arxiv.org/abs/2504.03600
+- MedSAM2 GitHub repository. https://github.com/bowang-lab/MedSAM2
+- MedSAM2 Hugging Face model card and checkpoints. https://huggingface.co/wanglab/MedSAM2

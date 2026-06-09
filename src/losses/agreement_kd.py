@@ -31,9 +31,9 @@ def js_divergence(p: Tensor, q: Tensor, dim: int = 1, eps: float = 1e-8) -> Tens
     return 0.5 * (kl_pm + kl_qm).clamp_min(0.0)
 
 
-def agreement_map(p_medical_sam3: Tensor, p_cinema: Tensor, eps: float = 1e-8, normalize: bool = False) -> Tensor:
+def agreement_map(p_semantic_teacher: Tensor, p_cinema: Tensor, eps: float = 1e-8, normalize: bool = False) -> Tensor:
     """Return high values where both teachers agree."""
-    js = js_divergence(p_medical_sam3, p_cinema, eps=eps)
+    js = js_divergence(p_semantic_teacher, p_cinema, eps=eps)
     if normalize:
         max_js = js.flatten(1).amax(dim=1).view(-1, 1, 1, 1).clamp_min(eps)
         return (1.0 - js / max_js).clamp(0.0, 1.0)
@@ -41,9 +41,9 @@ def agreement_map(p_medical_sam3: Tensor, p_cinema: Tensor, eps: float = 1e-8, n
 
 
 def agreement_aware_fusion(
-    p_medical_sam3: Tensor,
+    p_semantic_teacher: Tensor,
     p_cinema: Tensor,
-    c_medical_sam3: Tensor,
+    c_semantic_teacher: Tensor,
     c_cinema: Tensor,
     *,
     gt_mask: Tensor | None = None,
@@ -51,14 +51,14 @@ def agreement_aware_fusion(
     disable_agreement_weighting: bool = False,
     eps: float = 1e-8,
 ) -> dict[str, Tensor]:
-    """Fuse Medical-SAM3 field target and CineMA boundary/anatomy target."""
-    p_m3 = normalize_probs(p_medical_sam3.detach(), eps=eps)
+    """Fuse MedSAM2/semantic field target and CineMA boundary/anatomy target."""
+    p_m3 = normalize_probs(p_semantic_teacher.detach(), eps=eps)
     p_c = normalize_probs(p_cinema.detach(), eps=eps)
     if p_c.shape[-2:] != p_m3.shape[-2:]:
         p_c = F.interpolate(p_c, size=p_m3.shape[-2:], mode="bilinear", align_corners=False)
         p_c = normalize_probs(p_c, eps=eps)
 
-    c_m3 = _ensure_weight_map(c_medical_sam3.detach(), p_m3.shape[-2:], p_m3.device)
+    c_m3 = _ensure_weight_map(c_semantic_teacher.detach(), p_m3.shape[-2:], p_m3.device)
     c_c = _ensure_weight_map(c_cinema.detach(), p_m3.shape[-2:], p_m3.device)
     if gt_mask is not None:
         w_boundary = extract_boundary_band(gt_mask.to(p_m3.device), radius=3)
@@ -107,11 +107,11 @@ def soft_kl_loss(
 
 def segmentation_field_kd_loss(
     student_logits: Tensor,
-    p_medical_sam3: Tensor,
+    p_semantic_teacher: Tensor,
     w_interior: Tensor,
     temperature: float = 4.0,
 ) -> Tensor:
-    return soft_kl_loss(student_logits, p_medical_sam3, temperature=temperature, weight=w_interior)
+    return soft_kl_loss(student_logits, p_semantic_teacher, temperature=temperature, weight=w_interior)
 
 
 def cinema_boundary_kd_loss(
@@ -178,6 +178,7 @@ def compute_dual_teacher_kd_loss(
     p_m3 = _pick(
         teacher_outputs,
         "P_M3",
+        "medsam2_probs",
         "medical_sam3_probs",
         "m3_probs",
         "probs_m3",
@@ -186,7 +187,14 @@ def compute_dual_teacher_kd_loss(
     if p_m3 is None:
         p_m3 = p_c.detach()
     p_m3 = p_m3.to(device)
-    c_m3 = _pick(teacher_outputs, "C_M3", "medical_sam3_confidence", "m3_confidence", default=torch.ones_like(p_m3[:, :1])).to(device)
+    c_m3 = _pick(
+        teacher_outputs,
+        "C_M3",
+        "medsam2_confidence",
+        "medical_sam3_confidence",
+        "m3_confidence",
+        default=torch.ones_like(p_m3[:, :1]),
+    ).to(device)
     c_c = _pick(teacher_outputs, "C_C", "cinema_confidence", "cine_confidence", default=torch.ones_like(p_c[:, :1])).to(device)
     b_c = _pick(teacher_outputs, "B_C", "cinema_boundary", "boundary", default=None)
     if b_c is not None:

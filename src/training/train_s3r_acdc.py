@@ -38,7 +38,7 @@ from models.s3r.losses import boundary_map_from_mask
 from models.s3r.metrics import HAS_SCIPY, segmentation_surface_metrics
 from models.s3r.spectral_utils import build_radial_frequency_masks
 from losses.agreement_kd import compute_dual_teacher_kd_loss
-from teachers import CineMATeacher, MedicalSAM3Teacher, TeacherLoadError
+from teachers import CineMATeacher, MedSAM2Teacher, TeacherLoadError
 from teachers.teacher_utils import load_dual_teacher_cache, resize_teacher_output_to_student
 
 
@@ -80,14 +80,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb_mode", default=None)
     parser.add_argument("--use_dual_teacher_kd", action="store_true", default=None)
     parser.add_argument("--teacher_stub", action="store_true", default=None)
-    parser.add_argument("--medical_sam3_stub", action="store_true", default=None)
+    parser.add_argument("--medsam2_stub", action="store_true", default=None)
     parser.add_argument("--cinema_stub", action="store_true", default=None)
     parser.add_argument("--teacher_cache_dir", default=None)
     parser.add_argument("--strict_teacher_cache", action="store_true", default=None)
     parser.add_argument("--precompute_teachers", action="store_true", default=None)
-    parser.add_argument("--medical_sam3_repo_path", default=None)
-    parser.add_argument("--medical_sam3_ckpt_dir", default=None)
-    parser.add_argument("--medical_sam3_prompt_mode", default=None)
+    parser.add_argument("--medsam2_repo_path", default=None)
+    parser.add_argument("--medsam2_ckpt_dir", default=None)
+    parser.add_argument("--medsam2_ckpt", default=None)
+    parser.add_argument("--medsam2_config", default=None)
+    parser.add_argument("--medsam2_prompt_mode", default=None)
     parser.add_argument("--cinema_repo_path", default=None)
     parser.add_argument("--cinema_ckpt_dir", default=None)
     parser.add_argument("--cinema_ckpt", default=None)
@@ -113,6 +115,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable_spectral_kd", action="store_true", default=None)
     parser.add_argument("--disable_agreement_weighting", action="store_true", default=None)
     parser.add_argument("--use_vanilla_kd_only", action="store_true", default=None)
+    parser.add_argument("--medical_sam3_stub", action="store_true", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--medical_sam3_repo_path", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--medical_sam3_ckpt_dir", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--medical_sam3_prompt_mode", default=None, help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -131,6 +137,20 @@ def deep_update(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
         else:
             out[key] = copy.deepcopy(value)
     return out
+
+
+def normalize_medsam2_kd_config(kd: dict[str, Any]) -> dict[str, Any]:
+    """Map deprecated Medical-SAM3 config keys onto the MedSAM2 teacher slot."""
+    aliases = {
+        "medical_sam3_stub": "medsam2_stub",
+        "medical_sam3_repo_path": "medsam2_repo_path",
+        "medical_sam3_ckpt_dir": "medsam2_ckpt_dir",
+        "medical_sam3_prompt_mode": "medsam2_prompt_mode",
+    }
+    for old_key, new_key in aliases.items():
+        if new_key not in kd and old_key in kd:
+            kd[new_key] = kd[old_key]
+    return kd
 
 
 def apply_config_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -165,17 +185,19 @@ def apply_config_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
     wandb_cfg.setdefault("run_name", None)
     wandb_cfg.setdefault("mode", "online")
 
-    kd = cfg.setdefault("dual_teacher_kd", {})
+    kd = normalize_medsam2_kd_config(cfg.setdefault("dual_teacher_kd", {}))
     kd.setdefault("enabled", False)
     kd.setdefault("teacher_stub", False)
-    kd.setdefault("medical_sam3_stub", False)
+    kd.setdefault("medsam2_stub", False)
     kd.setdefault("cinema_stub", False)
     kd.setdefault("teacher_cache_dir", None)
     kd.setdefault("strict_teacher_cache", False)
     kd.setdefault("precompute_teachers", False)
-    kd.setdefault("medical_sam3_repo_path", "external/Medical-SAM3")
-    kd.setdefault("medical_sam3_ckpt_dir", "checkpoints/teachers/medical_sam3")
-    kd.setdefault("medical_sam3_prompt_mode", "gt_box")
+    kd.setdefault("medsam2_repo_path", "external/MedSAM2")
+    kd.setdefault("medsam2_ckpt_dir", "checkpoints/teachers/medsam2")
+    kd.setdefault("medsam2_ckpt", "")
+    kd.setdefault("medsam2_config", "configs/sam2.1_hiera_t512.yaml")
+    kd.setdefault("medsam2_prompt_mode", "gt_box")
     kd.setdefault("cinema_repo_path", "external/CineMA")
     kd.setdefault("cinema_ckpt_dir", "checkpoints/teachers/cinema")
     kd.setdefault("cinema_ckpt", "")
@@ -308,14 +330,16 @@ def apply_variant_and_cli(cfg: dict[str, Any], args: argparse.Namespace) -> dict
         kd_cli["enabled"] = True
     for arg_key, cfg_key in (
         ("teacher_stub", "teacher_stub"),
-        ("medical_sam3_stub", "medical_sam3_stub"),
+        ("medsam2_stub", "medsam2_stub"),
         ("cinema_stub", "cinema_stub"),
         ("teacher_cache_dir", "teacher_cache_dir"),
         ("strict_teacher_cache", "strict_teacher_cache"),
         ("precompute_teachers", "precompute_teachers"),
-        ("medical_sam3_repo_path", "medical_sam3_repo_path"),
-        ("medical_sam3_ckpt_dir", "medical_sam3_ckpt_dir"),
-        ("medical_sam3_prompt_mode", "medical_sam3_prompt_mode"),
+        ("medsam2_repo_path", "medsam2_repo_path"),
+        ("medsam2_ckpt_dir", "medsam2_ckpt_dir"),
+        ("medsam2_ckpt", "medsam2_ckpt"),
+        ("medsam2_config", "medsam2_config"),
+        ("medsam2_prompt_mode", "medsam2_prompt_mode"),
         ("cinema_repo_path", "cinema_repo_path"),
         ("cinema_ckpt_dir", "cinema_ckpt_dir"),
         ("cinema_ckpt", "cinema_ckpt"),
@@ -341,6 +365,15 @@ def apply_variant_and_cli(cfg: dict[str, Any], args: argparse.Namespace) -> dict
         ("disable_spectral_kd", "disable_spectral_kd"),
         ("disable_agreement_weighting", "disable_agreement_weighting"),
         ("use_vanilla_kd_only", "use_vanilla_kd_only"),
+    ):
+        value = getattr(args, arg_key)
+        if value is not None:
+            kd_cli[cfg_key] = value
+    for arg_key, cfg_key in (
+        ("medical_sam3_stub", "medsam2_stub"),
+        ("medical_sam3_repo_path", "medsam2_repo_path"),
+        ("medical_sam3_ckpt_dir", "medsam2_ckpt_dir"),
+        ("medical_sam3_prompt_mode", "medsam2_prompt_mode"),
     ):
         value = getattr(args, arg_key)
         if value is not None:
@@ -604,7 +637,7 @@ def build_teacher_kd_context(cfg: dict[str, Any], student_device: torch.device) 
     context: dict[str, Any] = {
         "cfg": kd,
         "teacher_device": teacher_device,
-        "medical_sam3": None,
+        "medsam2": None,
         "cinema": None,
     }
     cache_dir = kd.get("teacher_cache_dir")
@@ -613,16 +646,18 @@ def build_teacher_kd_context(cfg: dict[str, Any], student_device: torch.device) 
 
     needs_online_teacher = not cache_dir or not bool(kd.get("strict_teacher_cache", False))
     if needs_online_teacher:
-        need_m3 = needs_medical_sam3_teacher(kd)
+        need_m3 = needs_medsam2_teacher(kd)
         if need_m3:
-            context["medical_sam3"] = MedicalSAM3Teacher(
-                kd.get("medical_sam3_ckpt_dir"),
+            context["medsam2"] = MedSAM2Teacher(
+                kd.get("medsam2_ckpt_dir"),
                 device=teacher_device,
                 num_classes=int(cfg["num_classes"]),
                 image_size=int(cfg["image_size"]),
-                repo_path=kd.get("medical_sam3_repo_path", "external/Medical-SAM3"),
-                prompt_mode=kd.get("medical_sam3_prompt_mode", "gt_box"),
-                teacher_stub=bool(kd.get("teacher_stub", False)) or bool(kd.get("medical_sam3_stub", False)),
+                repo_path=kd.get("medsam2_repo_path", "external/MedSAM2"),
+                checkpoint_path=kd.get("medsam2_ckpt") or None,
+                config_path=kd.get("medsam2_config", "configs/sam2.1_hiera_t512.yaml"),
+                prompt_mode=kd.get("medsam2_prompt_mode", "gt_box"),
+                teacher_stub=bool(kd.get("teacher_stub", False)) or bool(kd.get("medsam2_stub", False)),
             )
         context["cinema"] = CineMATeacher(
             kd.get("cinema_ckpt_dir"),
@@ -639,8 +674,8 @@ def build_teacher_kd_context(cfg: dict[str, Any], student_device: torch.device) 
             teacher_stub=bool(kd.get("teacher_stub", False)) or bool(kd.get("cinema_stub", False)),
         )
         try:
-            if context["medical_sam3"] is not None:
-                context["medical_sam3"].load()
+            if context["medsam2"] is not None:
+                context["medsam2"].load()
             context["cinema"].load()
         except TeacherLoadError as exc:
             if cache_dir and not bool(kd.get("strict_teacher_cache", False)):
@@ -655,8 +690,8 @@ def build_teacher_kd_context(cfg: dict[str, Any], student_device: torch.device) 
     return context
 
 
-def needs_medical_sam3_teacher(kd: dict[str, Any]) -> bool:
-    """Return whether current KD settings require Medical-SAM3 outputs."""
+def needs_medsam2_teacher(kd: dict[str, Any]) -> bool:
+    """Return whether current KD settings require MedSAM2 semantic-field outputs."""
     if bool(kd.get("use_vanilla_kd_only", False)):
         return True
     field_enabled = not bool(kd.get("disable_field_kd", False)) and float(kd.get("lambda_field", 0.0) or 0.0) > 0
@@ -664,10 +699,13 @@ def needs_medical_sam3_teacher(kd: dict[str, Any]) -> bool:
     return field_enabled or fused_enabled
 
 
+needs_medical_sam3_teacher = needs_medsam2_teacher
+
+
 def format_teacher_kd_startup_log(kd: dict[str, Any], context: dict[str, Any], cache_dir: str | Path | None) -> str:
     """Human-readable KD config block printed once per run."""
     cinema = context.get("cinema")
-    medical = context.get("medical_sam3")
+    medsam2 = context.get("medsam2")
     lines = [
         "Dual-teacher KD enabled:",
         f"  source={'cache:'+str(cache_dir) if cache_dir else 'online teachers'}",
@@ -682,7 +720,7 @@ def format_teacher_kd_startup_log(kd: dict[str, Any], context: dict[str, Any], c
         f"cine_boundary={bool(kd.get('disable_cine_boundary_kd', False))} "
         f"fused={bool(kd.get('disable_fused_kd', False))} spectral={bool(kd.get('disable_spectral_kd', False))} "
         f"agreement={bool(kd.get('disable_agreement_weighting', False))}",
-        f"  Medical-SAM3={'enabled' if medical is not None else 'not required'}",
+        f"  MedSAM2={'enabled' if medsam2 is not None else 'not required'}",
     ]
     if cinema is not None:
         cinema_meta = getattr(cinema, "meta", {}) or {}
@@ -713,7 +751,7 @@ def load_or_compute_teacher_outputs(
                 raise
 
     cinema = kd_context.get("cinema")
-    m3 = kd_context.get("medical_sam3")
+    m3 = kd_context.get("medsam2") or kd_context.get("medical_sam3")
     if cinema is None:
         raise FileNotFoundError(
             "Teacher cache item is missing and online teachers are not loaded. "

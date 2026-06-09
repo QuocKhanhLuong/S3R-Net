@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Precompute Medical-SAM3 and CineMA teacher outputs for ACDC slices."""
+"""Precompute MedSAM2 and CineMA teacher outputs for ACDC slices."""
 
 from __future__ import annotations
 
@@ -20,18 +20,20 @@ for path in (ROOT, SRC):
         sys.path.insert(0, str(path))
 
 from data.acdc_s3r_dataset import ACDCSSRSliceDataset
-from teachers import CineMATeacher, MedicalSAM3Teacher
+from teachers import CineMATeacher, MedSAM2Teacher
 from teachers.teacher_utils import save_dual_teacher_cache
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Precompute dual-teacher outputs")
-    parser.add_argument("--teacher", choices=["medical_sam3", "cinema", "both"], default="both")
+    parser.add_argument("--teacher", choices=["medsam2", "medical_sam3", "cinema", "both"], default="both")
     parser.add_argument("--data_dir", "--data_root", dest="data_dir", default="preprocessed_data/ACDC/training")
     parser.add_argument("--output_dir", default="teacher_cache/acdc")
-    parser.add_argument("--medical_sam3_repo_path", default="external/Medical-SAM3")
-    parser.add_argument("--medical_sam3_ckpt_dir", default="checkpoints/teachers/medical_sam3")
-    parser.add_argument("--medical_sam3_prompt_mode", default="gt_box")
+    parser.add_argument("--medsam2_repo_path", default="external/MedSAM2")
+    parser.add_argument("--medsam2_ckpt_dir", default="checkpoints/teachers/medsam2")
+    parser.add_argument("--medsam2_ckpt", default="")
+    parser.add_argument("--medsam2_config", default="configs/sam2.1_hiera_t512.yaml")
+    parser.add_argument("--medsam2_prompt_mode", default="gt_box")
     parser.add_argument("--cinema_repo_path", default="external/CineMA")
     parser.add_argument("--cinema_ckpt_dir", default="checkpoints/teachers/cinema")
     parser.add_argument("--cinema_ckpt", default="")
@@ -46,14 +48,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_slices", type=int, default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--teacher_stub", action="store_true")
-    parser.add_argument("--medical_sam3_stub", action="store_true")
+    parser.add_argument("--medsam2_stub", action="store_true")
     parser.add_argument("--cinema_stub", action="store_true")
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--medical_sam3_repo_path", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--medical_sam3_ckpt_dir", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--medical_sam3_prompt_mode", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--medical_sam3_stub", action="store_true", default=None, help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    normalize_medsam2_args(args)
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
     dataset = ACDCSSRSliceDataset(
         args.data_dir,
@@ -65,15 +72,17 @@ def main() -> None:
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=args.num_workers)
     m3 = None
     cinema = None
-    if args.teacher in {"medical_sam3", "both"}:
-        m3 = MedicalSAM3Teacher(
-            args.medical_sam3_ckpt_dir,
+    if args.teacher in {"medsam2", "both"}:
+        m3 = MedSAM2Teacher(
+            args.medsam2_ckpt_dir,
             device=device,
             num_classes=args.num_classes,
             image_size=args.image_size,
-            repo_path=args.medical_sam3_repo_path,
-            prompt_mode=args.medical_sam3_prompt_mode,
-            teacher_stub=args.teacher_stub or args.medical_sam3_stub,
+            repo_path=args.medsam2_repo_path,
+            checkpoint_path=args.medsam2_ckpt or None,
+            config_path=args.medsam2_config,
+            prompt_mode=args.medsam2_prompt_mode,
+            teacher_stub=args.teacher_stub or args.medsam2_stub,
         )
         m3.load()
     if args.teacher in {"cinema", "both"}:
@@ -107,7 +116,7 @@ def main() -> None:
                 "slice_idx": slice_idx,
                 "shape": list(batch["image"].shape[-2:]),
                 "class_order": ["BG", "RV", "MYO", "LV"][: args.num_classes],
-                "medical_sam3_prompt_mode": args.medical_sam3_prompt_mode,
+                "medsam2_prompt_mode": args.medsam2_prompt_mode,
                 "teacher_stub": bool(args.teacher_stub),
                 "teacher": args.teacher,
             },
@@ -137,6 +146,20 @@ def main() -> None:
         json.dump(manifest, f, indent=2)
         f.write("\n")
     print(f"Saved {saved} teacher cache items under {output_dir}")
+
+
+def normalize_medsam2_args(args: argparse.Namespace) -> None:
+    if args.teacher == "medical_sam3":
+        print("--teacher medical_sam3 is deprecated; using medsam2.")
+        args.teacher = "medsam2"
+    if args.medical_sam3_repo_path:
+        args.medsam2_repo_path = args.medical_sam3_repo_path
+    if args.medical_sam3_ckpt_dir:
+        args.medsam2_ckpt_dir = args.medical_sam3_ckpt_dir
+    if args.medical_sam3_prompt_mode:
+        args.medsam2_prompt_mode = args.medical_sam3_prompt_mode
+    if args.medical_sam3_stub is not None:
+        args.medsam2_stub = bool(args.medical_sam3_stub)
 
 
 def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:

@@ -98,6 +98,11 @@ checkpoints_egm/
 *.pth
 *.ckpt
 
+# External teacher repos
+external/**
+!external/**/
+!external/**/.gitkeep
+
 # Preprocessed data
 preprocessed_data/
 

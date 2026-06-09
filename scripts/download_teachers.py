@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download Medical-SAM3 and CineMA teacher weights from Hugging Face."""
+"""Download MedSAM2 and CineMA teacher weights from Hugging Face."""
 
 from __future__ import annotations
 
@@ -15,13 +15,15 @@ CHECKPOINT_EXTENSIONS = (".pt", ".pth", ".ckpt", ".safetensors", ".bin")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download frozen teacher checkpoints")
-    parser.add_argument("--teacher", choices=["medical_sam3", "cinema", "both"], default="both")
-    parser.add_argument("--medical_sam3_repo", default="ChongCong/Medical-SAM3")
+    parser.add_argument("--teacher", choices=["medsam2", "medical_sam3", "cinema", "both"], default="both")
+    parser.add_argument("--medsam2_repo", default="wanglab/MedSAM2")
+    parser.add_argument("--medsam2_filename", default="MedSAM2_latest.pt")
     parser.add_argument("--cinema_repo", default="mathpluscode/CineMA")
     parser.add_argument("--output_dir", default="checkpoints/teachers")
     parser.add_argument("--revision", default=None)
     parser.add_argument("--allow_patterns", default=None, help="Comma-separated HF allow_patterns override.")
     parser.add_argument("--ignore_patterns", default=None, help="Comma-separated HF ignore_patterns override.")
+    parser.add_argument("--medical_sam3_repo", default=None, help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -35,9 +37,12 @@ def main() -> None:
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     downloads = []
-    if args.teacher in {"medical_sam3", "both"}:
-        downloads.append(("medical_sam3", args.medical_sam3_repo, output_dir / "medical_sam3", ["checkpoint.pt"]))
-    if args.teacher in {"cinema", "both"}:
+    teacher = "medsam2" if args.teacher == "medical_sam3" else args.teacher
+    if args.teacher == "medical_sam3":
+        print("--teacher medical_sam3 is deprecated; using MedSAM2 instead.")
+    if teacher in {"medsam2", "both"}:
+        downloads.append(("medsam2", args.medsam2_repo, output_dir / "medsam2", [args.medsam2_filename]))
+    if teacher in {"cinema", "both"}:
         downloads.append(
             (
                 "cinema",

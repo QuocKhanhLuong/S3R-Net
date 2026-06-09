@@ -183,7 +183,7 @@ def make_teacher_stub(batch: dict[str, Any], num_classes: int, mode: str) -> dic
         labels = labels.clamp(0, num_classes - 1)
 
     probs = F.one_hot(labels, num_classes=num_classes).permute(0, 3, 1, 2).float()
-    if mode.lower() in {"medical_sam3", "m3", "field"}:
+    if mode.lower() in {"medsam2", "medical_sam3", "m3", "field"}:
         probs = 0.92 * probs + 0.08 / float(num_classes)
     elif mode.lower() in {"cinema", "cine", "boundary"}:
         boundary = extract_boundary_band(labels, radius=2)

@@ -143,7 +143,16 @@ Distillation uses the same compact metric table and supports:
 
 ## Agreement-Aware Dual-Teacher KD
 
-Optional training-time KD can use frozen Medical-SAM3 and CineMA teachers:
+Optional training-time KD can use frozen MedSAM2 and CineMA teachers:
+
+```bash
+bash scripts/setup_teachers.sh medsam2
+python scripts/download_teachers.py \
+  --teacher medsam2 \
+  --medsam2_repo wanglab/MedSAM2 \
+  --medsam2_filename MedSAM2_latest.pt \
+  --output_dir checkpoints/teachers
+```
 
 ```bash
 python src/training/train_s3r_acdc.py \

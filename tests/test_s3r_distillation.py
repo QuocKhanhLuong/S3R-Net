@@ -18,7 +18,7 @@ from src.distillation.teacher_targets import (
     teacher_agreement_weight,
 )
 from src.losses.agreement_kd import agreement_aware_fusion, compute_dual_teacher_kd_loss
-from src.teachers import CineMATeacher, MedicalSAM3Teacher
+from src.teachers import CineMATeacher, MedSAM2Teacher
 
 
 def test_teacher_cache_round_trip_and_validation(tmp_path: Path) -> None:
@@ -157,7 +157,7 @@ def test_dual_teacher_kd_loss_and_stub_outputs_are_finite() -> None:
         "image": torch.randn(2, 1, 16, 16),
         "mask": torch.randint(0, 4, (2, 16, 16)),
     }
-    m3 = MedicalSAM3Teacher(None, device="cpu", num_classes=4, teacher_stub=True)
+    m3 = MedSAM2Teacher(None, device="cpu", num_classes=4, teacher_stub=True)
     cinema = CineMATeacher(None, device="cpu", num_classes=4, teacher_stub=True)
     out_m3 = m3(batch)
     out_c = cinema(batch)
@@ -177,35 +177,45 @@ def test_dual_teacher_kd_loss_and_stub_outputs_are_finite() -> None:
     assert fusion["P_F"].shape == (2, 4, 16, 16)
 
 
-def test_medical_sam3_real_adapter_binds_inference_module(tmp_path: Path) -> None:
-    repo = tmp_path / "Medical-SAM3"
-    inference_dir = repo / "inference"
-    inference_dir.mkdir(parents=True)
-    (repo / "sam3").mkdir()
+def test_medsam2_real_adapter_binds_video_predictor(tmp_path: Path) -> None:
+    repo = tmp_path / "MedSAM2"
+    sam2_dir = repo / "sam2"
+    sam2_dir.mkdir(parents=True)
+    (sam2_dir / "__init__.py").write_text("", encoding="utf-8")
     ckpt_dir = tmp_path / "checkpoints"
     ckpt_dir.mkdir()
-    (ckpt_dir / "checkpoint.pt").write_bytes(b"fake")
-    (inference_dir / "sam3_inference.py").write_text(
+    (ckpt_dir / "older.pt").write_bytes(b"old")
+    (ckpt_dir / "MedSAM2_latest.pt").write_bytes(b"fake")
+    (sam2_dir / "build_sam.py").write_text(
         """
 import numpy as np
+import torch
 
-SAM3_ROOT = None
+class FakePredictor:
+    def __init__(self, cfg, checkpoint):
+        self.cfg = cfg
+        self.checkpoint = checkpoint
 
-class SAM3Model:
-    def __init__(self, confidence_threshold=0.1, device='cpu', checkpoint_path=None):
-        self.confidence_threshold = confidence_threshold
-        self.device = device
-        self.checkpoint_path = checkpoint_path
+    def init_state(self, image, video_height, video_width):
+        return {'height': video_height, 'width': video_width}
 
-    def encode_image(self, image):
-        return {'shape': image.shape}
-
-    def predict_box(self, inference_state, bbox, img_size):
-        h, w = img_size
-        x_min, y_min, x_max, y_max = bbox
+    def add_new_points_or_box(self, inference_state, frame_idx, obj_id, box=None, **kwargs):
+        h = inference_state['height']
+        w = inference_state['width']
+        x_min, y_min, x_max, y_max = [int(v) for v in box]
         mask = np.zeros((h, w), dtype=np.uint8)
         mask[max(y_min, 0):min(y_max + 1, h), max(x_min, 0):min(x_max + 1, w)] = 1
-        return mask
+        logits = torch.from_numpy(mask).float().view(1, 1, h, w)
+        return None, [obj_id], logits
+
+    def propagate_in_video(self, inference_state, reverse=False):
+        return []
+
+    def reset_state(self, inference_state):
+        pass
+
+def build_sam2_video_predictor_npz(cfg, checkpoint):
+    return FakePredictor(cfg, checkpoint)
 """,
         encoding="utf-8",
     )
@@ -214,22 +224,26 @@ class SAM3Model:
         "mask": torch.zeros(1, 16, 16, dtype=torch.long),
     }
     batch["mask"][:, 4:10, 5:12] = 1
-    teacher = MedicalSAM3Teacher(
+    teacher = MedSAM2Teacher(
         ckpt_dir,
         device="cpu",
         num_classes=4,
         image_size=16,
         repo_path=repo,
+        config_path=repo / "configs" / "sam2.1_hiera_t512.yaml",
         teacher_stub=False,
     )
 
     out = teacher(batch)
 
+    assert teacher.checkpoint_path is not None
+    assert teacher.checkpoint_path.name == "MedSAM2_latest.pt"
     assert out["probs"].shape == (1, 4, 16, 16)
     assert out["confidence"].shape == (1, 1, 16, 16)
     assert out["boundary"].shape == (1, 1, 16, 16)
     assert torch.isfinite(out["probs"]).all()
     assert float(out["probs"][:, 1].max()) > 0.0
+    assert out["meta"]["teacher"] == "medsam2"
 
 
 def test_agreement_gated_fused_kd_reports_bounded_weight() -> None:
