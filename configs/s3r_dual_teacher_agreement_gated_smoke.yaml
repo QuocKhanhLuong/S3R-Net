@@ -1,0 +1,24 @@
+model: s3r_mini
+run_name: s3r_dual_teacher_agreement_gated_smoke
+data_root: preprocessed_data/ACDC
+output_root: weights
+save_dir: weights/smoke_dual_teacher_agreement_gated
+device: cpu
+epochs: 1
+batch_size: 2
+image_size: 224
+max_slices: 8
+num_workers: 0
+use_tqdm: false
+
+dual_teacher_kd:
+  enabled: true
+  teacher_stub: true
+  kd_temperature: 4.0
+  lambda_field: 0.3
+  lambda_cine_boundary: 0.5
+  lambda_fuse: 0.5
+  lambda_spec: 0.05
+  fused_kd_weight_mode: agreement
+  fused_kd_min_weight: 0.10
+  fused_kd_agreement_power: 1.0

@@ -175,3 +175,84 @@ def test_dual_teacher_kd_loss_and_stub_outputs_are_finite() -> None:
     assert math.isfinite(float(loss.detach()))
     assert parts["loss_kd"] >= 0.0
     assert fusion["P_F"].shape == (2, 4, 16, 16)
+
+
+def test_agreement_gated_fused_kd_reports_bounded_weight() -> None:
+    gt_mask = torch.zeros(1, 8, 8, dtype=torch.long)
+    p_m3 = torch.zeros(1, 4, 8, 8)
+    p_m3[:, 1] = 1.0
+    p_c = torch.zeros(1, 4, 8, 8)
+    p_c[:, 2] = 1.0
+    teacher = {
+        "P_M3": p_m3,
+        "C_M3": torch.ones(1, 1, 8, 8),
+        "P_C": p_c,
+        "C_C": torch.ones(1, 1, 8, 8),
+        "B_C": torch.zeros(1, 1, 8, 8),
+    }
+    student = {"seg_logits": torch.randn(1, 4, 8, 8)}
+
+    _, parts, fusion = compute_dual_teacher_kd_loss(
+        student,
+        teacher,
+        gt_mask,
+        {
+            "dual_teacher_kd": {
+                "fused_kd_weight_mode": "agreement",
+                "fused_kd_min_weight": 0.25,
+                "fused_kd_agreement_power": 2.0,
+            }
+        },
+    )
+
+    fuse_weight = fusion["W_fuse"]
+    assert torch.isfinite(fuse_weight).all()
+    assert float(fuse_weight.min()) >= 0.25
+    assert float(fuse_weight.max()) <= 1.0
+    assert 0.25 <= parts["fuse_weight_mean"] <= 1.0
+    assert 0.25 <= parts["fuse_weight_min"] <= parts["fuse_weight_max"] <= 1.0
+    assert 0.0 <= parts["teacher_disagreement_mean"] <= 1.0
+
+
+def test_agreement_gated_fused_kd_reduces_fuse_loss_against_unweighted_mode() -> None:
+    gt_mask = torch.zeros(1, 8, 8, dtype=torch.long)
+    student = {"seg_logits": torch.randn(1, 4, 8, 8)}
+    p_m3 = torch.zeros(1, 4, 8, 8)
+    p_m3[:, 1] = 1.0
+    p_c = torch.zeros(1, 4, 8, 8)
+    p_c[:, 2] = 1.0
+    teacher = {
+        "P_M3": p_m3,
+        "C_M3": torch.ones(1, 1, 8, 8),
+        "P_C": p_c,
+        "C_C": torch.ones(1, 1, 8, 8),
+        "B_C": torch.zeros(1, 1, 8, 8),
+    }
+
+    cfg = {
+        "dual_teacher_kd": {
+            "lambda_field": 0.0,
+            "lambda_cine_boundary": 0.0,
+            "lambda_fuse": 1.0,
+            "lambda_spec": 0.0,
+            "disable_field_kd": True,
+            "disable_cine_boundary_kd": True,
+            "disable_spectral_kd": True,
+            "fused_kd_weight_mode": "none",
+        }
+    }
+    gated_cfg = {
+        "dual_teacher_kd": {
+            **cfg["dual_teacher_kd"],
+            "fused_kd_weight_mode": "agreement",
+            "fused_kd_min_weight": 0.05,
+            "fused_kd_agreement_power": 1.0,
+        }
+    }
+
+    _, unweighted_parts, _ = compute_dual_teacher_kd_loss(student, teacher, gt_mask, cfg)
+    _, gated_parts, _ = compute_dual_teacher_kd_loss(student, teacher, gt_mask, gated_cfg)
+
+    assert gated_parts["teacher_disagreement_mean"] > 0.0
+    assert gated_parts["fuse_weight_mean"] < unweighted_parts["fuse_weight_mean"]
+    assert gated_parts["loss_fuse"] < unweighted_parts["loss_fuse"]

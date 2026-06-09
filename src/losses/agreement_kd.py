@@ -92,6 +92,7 @@ def soft_kl_loss(
     teacher_probs: Tensor,
     temperature: float = 4.0,
     weight: Tensor | None = None,
+    normalize_weight: bool = True,
 ) -> Tensor:
     """Temperature-scaled KL from student logits to detached teacher probs."""
     teacher = normalize_probs(teacher_probs.detach()).to(student_logits.device)
@@ -101,7 +102,7 @@ def soft_kl_loss(
     T = float(temperature)
     log_p = F.log_softmax(student_logits / T, dim=1)
     loss = F.kl_div(log_p, teacher, reduction="none").sum(dim=1, keepdim=True) * (T * T)
-    return _weighted_mean(loss, weight)
+    return _weighted_mean(loss, weight, normalize=normalize_weight)
 
 
 def segmentation_field_kd_loss(
@@ -122,8 +123,13 @@ def cinema_boundary_kd_loss(
     return soft_kl_loss(student_logits, p_cinema, temperature=temperature, weight=w_boundary)
 
 
-def fused_kd_loss(student_logits: Tensor, fused_probs: Tensor, temperature: float = 4.0) -> Tensor:
-    return soft_kl_loss(student_logits, fused_probs, temperature=temperature, weight=None)
+def fused_kd_loss(
+    student_logits: Tensor,
+    fused_probs: Tensor,
+    temperature: float = 4.0,
+    weight: Tensor | None = None,
+) -> Tensor:
+    return soft_kl_loss(student_logits, fused_probs, temperature=temperature, weight=weight, normalize_weight=False)
 
 
 def spectral_boundary_loss(
@@ -201,10 +207,27 @@ def compute_dual_teacher_kd_loss(
         cinema_boundary=b_c,
         disable_agreement_weighting=bool(kd.get("disable_agreement_weighting", False)),
     )
+    fuse_weight_mode = str(kd.get("fused_kd_weight_mode", "none") or "none").lower()
+    fuse_weight = torch.ones_like(fusion["agreement"], device=device, dtype=logits.dtype)
+    if fuse_weight_mode == "agreement":
+        min_weight = float(kd.get("fused_kd_min_weight", 0.10))
+        min_weight = max(0.0, min(1.0, min_weight))
+        agreement_power = max(0.0, float(kd.get("fused_kd_agreement_power", 1.0)))
+        agreement = fusion["agreement"].to(device=device, dtype=logits.dtype).clamp(0.0, 1.0)
+        fuse_weight = min_weight + (1.0 - min_weight) * agreement.pow(agreement_power)
+    elif fuse_weight_mode != "none":
+        raise ValueError(f"Unsupported fused_kd_weight_mode={fuse_weight_mode!r}; expected 'none' or 'agreement'")
+    fusion["W_fuse"] = fuse_weight.detach()
+    teacher_disagreement = (1.0 - fusion["agreement"].to(device=device, dtype=logits.dtype)).clamp(0.0, 1.0)
+
     T = float(kd.get("kd_temperature", 4.0))
     field = zero if bool(kd.get("disable_field_kd", False)) else segmentation_field_kd_loss(logits, p_m3, fusion["W_interior"], T)
     cine_boundary = zero if bool(kd.get("disable_cine_boundary_kd", False)) else cinema_boundary_kd_loss(logits, p_c, fusion["W_boundary"], T)
-    fuse = zero if bool(kd.get("disable_fused_kd", False)) else fused_kd_loss(logits, fusion["P_F"], T)
+    fuse = (
+        zero
+        if bool(kd.get("disable_fused_kd", False))
+        else fused_kd_loss(logits, fusion["P_F"], T, weight=fuse_weight if fuse_weight_mode == "agreement" else None)
+    )
     spec = zero
     if not bool(kd.get("disable_spectral_kd", False)) and float(kd.get("lambda_spec", 0.05)) > 0:
         spec = spectral_boundary_loss(logits, b_c if b_c is not None else p_c)
@@ -228,6 +251,10 @@ def compute_dual_teacher_kd_loss(
         "loss_spec": float(spec.detach().cpu()),
         "loss_kd": float(total.detach().cpu()),
         "agreement_mean": float(fusion["agreement"].mean().detach().cpu()),
+        "teacher_disagreement_mean": float(teacher_disagreement.mean().detach().cpu()),
+        "fuse_weight_mean": float(fusion["W_fuse"].mean().detach().cpu()),
+        "fuse_weight_min": float(fusion["W_fuse"].min().detach().cpu()),
+        "fuse_weight_max": float(fusion["W_fuse"].max().detach().cpu()),
         "W_M3_mean": float(fusion["W_M3"].mean().detach().cpu()),
         "W_C_mean": float(fusion["W_C"].mean().detach().cpu()),
     }
@@ -252,11 +279,13 @@ def _ensure_weight_map(weight: Tensor, spatial: tuple[int, int], device: torch.d
     return weight.clamp(0.0, 1.0)
 
 
-def _weighted_mean(loss: Tensor, weight: Tensor | None) -> Tensor:
+def _weighted_mean(loss: Tensor, weight: Tensor | None, *, normalize: bool = True) -> Tensor:
     if weight is None:
         return loss.mean()
     weight = _ensure_weight_map(weight, loss.shape[-2:], loss.device)
-    return (loss * weight).sum() / weight.sum().clamp_min(1.0)
+    if normalize:
+        return (loss * weight).sum() / weight.sum().clamp_min(1.0)
+    return (loss * weight).mean()
 
 
 def _pick(payload: dict[str, Tensor], *keys: str, default: Tensor | object = _MISSING) -> Tensor | None:

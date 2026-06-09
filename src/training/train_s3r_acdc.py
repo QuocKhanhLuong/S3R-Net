@@ -101,6 +101,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_cine_boundary", type=float, default=None)
     parser.add_argument("--lambda_fuse", type=float, default=None)
     parser.add_argument("--lambda_spec", type=float, default=None)
+    parser.add_argument("--fused_kd_weight_mode", choices=["none", "agreement"], default=None)
+    parser.add_argument("--fused_kd_min_weight", type=float, default=None)
+    parser.add_argument("--fused_kd_agreement_power", type=float, default=None)
     parser.add_argument("--teacher_amp", action="store_true", default=None)
     parser.add_argument("--teacher_device", default=None)
     parser.add_argument("--teacher_eval_every", type=int, default=None)
@@ -186,6 +189,9 @@ def apply_config_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
     kd.setdefault("lambda_cine_boundary", 0.5)
     kd.setdefault("lambda_fuse", 0.5)
     kd.setdefault("lambda_spec", 0.05)
+    kd.setdefault("fused_kd_weight_mode", "none")
+    kd.setdefault("fused_kd_min_weight", 0.10)
+    kd.setdefault("fused_kd_agreement_power", 1.0)
     kd.setdefault("teacher_amp", False)
     kd.setdefault("teacher_device", "cuda")
     kd.setdefault("teacher_eval_every", 0)
@@ -323,6 +329,9 @@ def apply_variant_and_cli(cfg: dict[str, Any], args: argparse.Namespace) -> dict
         ("lambda_cine_boundary", "lambda_cine_boundary"),
         ("lambda_fuse", "lambda_fuse"),
         ("lambda_spec", "lambda_spec"),
+        ("fused_kd_weight_mode", "fused_kd_weight_mode"),
+        ("fused_kd_min_weight", "fused_kd_min_weight"),
+        ("fused_kd_agreement_power", "fused_kd_agreement_power"),
         ("teacher_amp", "teacher_amp"),
         ("teacher_device", "teacher_device"),
         ("teacher_eval_every", "teacher_eval_every"),
@@ -667,6 +676,8 @@ def format_teacher_kd_startup_log(kd: dict[str, Any], context: dict[str, Any], c
         f"  T={kd.get('kd_temperature')} lambda_field={kd.get('lambda_field')} "
         f"lambda_cine_boundary={kd.get('lambda_cine_boundary')} lambda_fuse={kd.get('lambda_fuse')} "
         f"lambda_spec={kd.get('lambda_spec')}",
+        f"  fused_kd_weight_mode={kd.get('fused_kd_weight_mode', 'none')} "
+        f"min_weight={kd.get('fused_kd_min_weight')} agreement_power={kd.get('fused_kd_agreement_power')}",
         f"  disables field={bool(kd.get('disable_field_kd', False))} "
         f"cine_boundary={bool(kd.get('disable_cine_boundary_kd', False))} "
         f"fused={bool(kd.get('disable_fused_kd', False))} spectral={bool(kd.get('disable_spectral_kd', False))} "
@@ -843,6 +854,10 @@ def print_epoch_report(epoch: int, train_metrics: dict[str, float], val_metrics:
             f"fuse={train_metrics.get('loss_fuse', math.nan):.4f} "
             f"spec={train_metrics.get('loss_spec', math.nan):.4f} "
             f"agree={train_metrics.get('agreement_mean', math.nan):.4f} "
+            f"disagree={train_metrics.get('teacher_disagreement_mean', math.nan):.4f} "
+            f"fuse_w={train_metrics.get('fuse_weight_mean', math.nan):.4f} "
+            f"fuse_w_range=[{train_metrics.get('fuse_weight_min', math.nan):.4f},"
+            f"{train_metrics.get('fuse_weight_max', math.nan):.4f}] "
             f"W_M3={train_metrics.get('W_M3_mean', math.nan):.4f} "
             f"W_C={train_metrics.get('W_C_mean', math.nan):.4f}"
         )
@@ -957,6 +972,10 @@ def run_epoch(
                             "loss_spec": 0.0,
                             "loss_kd": 0.0,
                             "agreement_mean": math.nan,
+                            "teacher_disagreement_mean": math.nan,
+                            "fuse_weight_mean": math.nan,
+                            "fuse_weight_min": math.nan,
+                            "fuse_weight_max": math.nan,
                             "W_M3_mean": math.nan,
                             "W_C_mean": math.nan,
                         }
@@ -1173,7 +1192,15 @@ def plot_training_curves(run_dir: Path, rows: list[dict[str, Any]], ssr_rows: li
             plt.savefig(run_dir / "kd_loss_components.png", dpi=160)
             plt.close()
 
-        kd_weight_keys = ["train_agreement_mean", "train_W_M3_mean", "train_W_C_mean"]
+        kd_weight_keys = [
+            "train_agreement_mean",
+            "train_teacher_disagreement_mean",
+            "train_fuse_weight_mean",
+            "train_fuse_weight_min",
+            "train_fuse_weight_max",
+            "train_W_M3_mean",
+            "train_W_C_mean",
+        ]
         if any(key in rows[0] for key in kd_weight_keys):
             plt.figure(figsize=(8, 4.5))
             for key in kd_weight_keys:
@@ -1350,6 +1377,10 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
             "train_loss_spec": train_metrics.get("loss_spec", math.nan),
             "train_loss_kd": train_metrics.get("loss_kd", math.nan),
             "train_agreement_mean": train_metrics.get("agreement_mean", math.nan),
+            "train_teacher_disagreement_mean": train_metrics.get("teacher_disagreement_mean", math.nan),
+            "train_fuse_weight_mean": train_metrics.get("fuse_weight_mean", math.nan),
+            "train_fuse_weight_min": train_metrics.get("fuse_weight_min", math.nan),
+            "train_fuse_weight_max": train_metrics.get("fuse_weight_max", math.nan),
             "train_W_M3_mean": train_metrics.get("W_M3_mean", math.nan),
             "train_W_C_mean": train_metrics.get("W_C_mean", math.nan),
             "val_boundary_bce": val_metrics["boundary_bce"],

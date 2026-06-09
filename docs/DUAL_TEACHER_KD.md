@@ -243,6 +243,26 @@ python src/training/train_s3r_acdc.py \
   --save_dir weights/smoke_dual_teacher_stub
 ```
 
+Agreement-gated fused KD smoke:
+
+```bash
+python src/training/train_s3r_acdc.py \
+  --config configs/s3r_dual_teacher_agreement_gated_smoke.yaml
+```
+
+The new fused-KD gate is opt-in. Default behavior remains the unweighted fused
+KD loss. Enable it with:
+
+```yaml
+dual_teacher_kd:
+  fused_kd_weight_mode: agreement
+  fused_kd_min_weight: 0.10
+  fused_kd_agreement_power: 1.0
+```
+
+This downweights fused KD where Medical-SAM3 and CineMA disagree while keeping
+field KD, CineMA boundary KD, and spectral KD unchanged.
+
 ## CineMA-Only Real Teacher Test
 
 After cloning CineMA and downloading weights, test the real CineMA wrapper without Medical-SAM3:
@@ -285,7 +305,9 @@ python src/training/train_s3r_acdc.py \
   --save_dir weights/smoke_cinema_real_kd
 ```
 
-The trainer prints the effective KD lambdas and per-epoch KD components, and saves `kd_loss_components.png` plus `kd_agreement_weights.png`.
+The trainer prints the effective KD lambdas, fused-KD weight mode, per-epoch KD
+components, `teacher_disagreement_mean`, `fuse_weight_mean`, and fuse-weight
+range; it saves `kd_loss_components.png` plus `kd_agreement_weights.png`.
 
 ## Ablations
 
@@ -298,6 +320,9 @@ Flags:
 --disable_spectral_kd
 --disable_agreement_weighting
 --use_vanilla_kd_only
+--fused_kd_weight_mode {none,agreement}
+--fused_kd_min_weight 0.10
+--fused_kd_agreement_power 1.0
 ```
 
 Suggested ablations:
