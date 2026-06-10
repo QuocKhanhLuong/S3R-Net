@@ -3,7 +3,6 @@ from __future__ import annotations
 import math
 
 import torch
-
 from src.models.s3r import S3RMini, S3RNet
 from src.models.s3r.losses import S3RLoss, boundary_map_from_mask
 from src.models.s3r.s3r_blocks import SSRFullBlock, build_radial_frequency_masks
@@ -19,6 +18,24 @@ def test_radial_frequency_masks_cover_rfft_spectrum() -> None:
 
     assert masks.shape == (4, 16, 11)
     assert torch.allclose(masks.sum(dim=0), torch.ones(16, 11))
+    assert torch.all((masks == 0) | (masks == 1))
+    assert torch.all(masks.sum(dim=(1, 2)) > 0)
+
+    odd_masks = build_radial_frequency_masks(15, 17, num_bands=4, device="cpu")
+    assert odd_masks.shape == (4, 15, 9)
+    assert torch.allclose(odd_masks.sum(dim=0), torch.ones(15, 9))
+    assert torch.all(odd_masks.sum(dim=(1, 2)) > 0)
+
+
+def test_fft_band_reconstruction_identity() -> None:
+    x = torch.randn(2, 3, 16, 20)
+    X = torch.fft.rfft2(x, norm="ortho")
+    masks = build_radial_frequency_masks(16, 20, num_bands=4, device=x.device).to(X.real.dtype)
+    reconstructed = torch.zeros_like(x)
+    for mask in masks:
+        reconstructed = reconstructed + torch.fft.irfft2(X * mask.view(1, 1, 16, 11), s=(16, 20), norm="ortho")
+
+    assert torch.mean(torch.abs(reconstructed - x)).item() < 1e-5
 
 
 def test_ssr_full_block_returns_aux_dictionary_and_logs() -> None:
@@ -41,9 +58,64 @@ def test_ssr_full_block_returns_aux_dictionary_and_logs() -> None:
         "variance",
         "boundary_to_nonboundary_high_ratio",
         "update_budget_sum",
+        "feature_norm",
+        "delta_norm",
+        "gamma_delta_norm",
+        "residual_ratio",
+        "gamma_raw",
+        "gamma_effective",
+        "relative_energy",
+        "log_energy",
+        "block_input_mean",
+        "block_input_std",
+        "block_output_mean",
+        "block_output_std",
+        "output_delta_mean",
+        "output_delta_std",
         "gamma",
     ):
         assert key in logs
+
+
+def test_ssr_gamma_zero_variant_is_identity_before_state_modulation() -> None:
+    block = SSRFullBlock(channels=8, num_bands=4, block_variant="s3r_gamma0")
+    x = torch.randn(2, 8, 16, 16)
+
+    y, aux = block(x, return_logs=True)
+
+    assert torch.allclose(y, x, atol=1e-5)
+    assert aux["logs"]["gamma_effective"] == 0.0
+    assert aux["logs"]["residual_ratio"] == 0.0
+
+
+def test_ssr_fft_identity_variant_reconstructs_without_nan() -> None:
+    block = SSRFullBlock(channels=8, num_bands=4, block_variant="s3r_fft_identity")
+    x = torch.randn(2, 8, 16, 16)
+
+    y, aux = block(x, return_logs=True)
+
+    assert torch.allclose(y, x, atol=1e-5)
+    assert torch.isfinite(y).all()
+    assert aux["logs"]["fft_reconstruction_error"] < 1e-5
+
+
+def test_ssr_block_variants_are_finite() -> None:
+    x = torch.randn(2, 8, 16, 16)
+    boundary = torch.zeros(2, 1, 16, 16)
+    variants = ("s3r_full", "s3r_gamma0", "s3r_fft_identity", "s3r_fixed_band", "s3r_no_suppress", "s3r_simple_spectral")
+
+    for variant in variants:
+        block = SSRFullBlock(channels=8, num_bands=4, block_variant=variant)
+        y, aux = block(x, boundary_mask=boundary, return_logs=True)
+        assert y.shape == x.shape
+        assert torch.isfinite(y).all(), variant
+        assert torch.isfinite(aux["gate_reg"]).all(), variant
+        assert torch.isfinite(aux["hf_ratio_penalty"]).all(), variant
+        for value in aux["logs"].values():
+            if isinstance(value, list):
+                assert all(math.isfinite(float(v)) for v in value), variant
+            elif isinstance(value, (float, int)):
+                assert math.isfinite(float(value)), variant
 
 
 def test_spectral_state_transition_and_modulation_shapes() -> None:

@@ -167,10 +167,15 @@ class SSRFullBlock(nn.Module):
         large_kernel_size: int = 7,
         use_hf_ratio_penalty: bool = True,
         hf_ratio_threshold: float = 4.0,
+        block_variant: str = "s3r_full",
     ) -> None:
         super().__init__()
         self.channels = int(channels)
         self.num_bands = int(num_bands)
+        self.block_variant = str(block_variant)
+        valid_variants = {"s3r_full", "s3r_gamma0", "s3r_fft_identity", "s3r_fixed_band", "s3r_no_suppress", "s3r_simple_spectral"}
+        if self.block_variant not in valid_variants:
+            raise ValueError(f"block_variant must be one of {sorted(valid_variants)}, got {self.block_variant!r}")
         self.update_budget = float(update_budget)
         self.min_update = float(min_update)
         self.noise_strength = float(noise_strength)
@@ -207,6 +212,10 @@ class SSRFullBlock(nn.Module):
             nn.GELU(),
             nn.Conv2d(channels, channels, kernel_size=3, padding=1),
         )
+        if self.block_variant == "s3r_simple_spectral":
+            self.simple_band_logits = nn.Parameter(torch.full((self.num_bands,), -2.0, dtype=torch.float32))
+        else:
+            self.simple_band_logits = None
 
         if self.use_bounded_gamma:
             self.gamma_raw = nn.Parameter(torch.tensor(float(gamma_init), dtype=torch.float32))
@@ -280,26 +289,45 @@ class SSRFullBlock(nn.Module):
         phase_coherence = torch.sqrt(cos_mean.square() + sin_mean.square()).clamp(0.0, 1.0)
 
         features = torch.stack([torch.log(energy + eps), torch.log(variance + eps), phase_coherence], dim=-1)
-        raw_retain = self.retain_mlp(features)
-        raw_suppress = self.suppress_mlp(features)
-        raw_update = self.update_mlp(features)
-
-        retain_gate = self.retain_floor + (1.0 - self.retain_floor) * torch.sigmoid(raw_retain)
-        remaining_budget = max(self.update_budget - self.num_bands * self.min_update, 0.0)
-        update_gate = self.min_update + remaining_budget * torch.softmax(raw_update, dim=1)
-        base_suppress = torch.sigmoid(raw_suppress)
-        if self.noise_aware_suppress:
-            energy_norm = energy / energy.mean(dim=1, keepdim=True).clamp_min(eps)
-            noise_score = (energy_norm * (1.0 - phase_coherence)).clamp(0.0, 2.0) / 2.0
-            noise_score = 0.25 + 0.75 * noise_score
-            suppress_gate = self.suppress_min + (self.suppress_max - self.suppress_min) * base_suppress * noise_score
+        if self.block_variant == "s3r_fft_identity":
+            retain_gate = torch.ones(B, self.num_bands, device=x.device, dtype=x_float.dtype)
+            update_gate = torch.zeros_like(retain_gate)
+            suppress_gate = torch.zeros_like(retain_gate)
+            gate_reg = torch.zeros((), device=x.device, dtype=x_float.dtype)
+        elif self.block_variant == "s3r_fixed_band":
+            retain_gate = torch.ones(B, self.num_bands, device=x.device, dtype=x_float.dtype)
+            update_gate = (self.update_target * self.update_budget).to(x.device, x_float.dtype).expand(B, -1)
+            suppress_gate = (0.5 * (self.suppress_min + self.suppress_max)).to(x.device, x_float.dtype).expand(B, -1)
+            gate_reg = torch.zeros((), device=x.device, dtype=x_float.dtype)
+        elif self.block_variant == "s3r_simple_spectral":
+            assert self.simple_band_logits is not None
+            retain_gate = torch.zeros(B, self.num_bands, device=x.device, dtype=x_float.dtype)
+            update_gate = torch.sigmoid(self.simple_band_logits).to(x.device, x_float.dtype).view(1, self.num_bands).expand(B, -1)
+            suppress_gate = torch.zeros_like(retain_gate)
+            gate_reg = torch.zeros((), device=x.device, dtype=x_float.dtype)
         else:
-            suppress_gate = self.suppress_min + (self.suppress_max - self.suppress_min) * base_suppress
+            raw_retain = self.retain_mlp(features)
+            raw_suppress = self.suppress_mlp(features)
+            raw_update = self.update_mlp(features)
 
-        gate_reg = F.mse_loss(
-            update_gate.mean(dim=0),
-            (self.update_target.squeeze(0) * self.update_budget).to(update_gate.device),
-        )
+            retain_gate = self.retain_floor + (1.0 - self.retain_floor) * torch.sigmoid(raw_retain)
+            remaining_budget = max(self.update_budget - self.num_bands * self.min_update, 0.0)
+            update_gate = self.min_update + remaining_budget * torch.softmax(raw_update, dim=1)
+            base_suppress = torch.sigmoid(raw_suppress)
+            if self.block_variant == "s3r_no_suppress":
+                suppress_gate = torch.zeros_like(update_gate)
+            elif self.noise_aware_suppress:
+                energy_norm = energy / energy.mean(dim=1, keepdim=True).clamp_min(eps)
+                noise_score = (energy_norm * (1.0 - phase_coherence)).clamp(0.0, 2.0) / 2.0
+                noise_score = 0.25 + 0.75 * noise_score
+                suppress_gate = self.suppress_min + (self.suppress_max - self.suppress_min) * base_suppress * noise_score
+            else:
+                suppress_gate = self.suppress_min + (self.suppress_max - self.suppress_min) * base_suppress
+
+            gate_reg = F.mse_loss(
+                update_gate.mean(dim=0),
+                (self.update_target.squeeze(0) * self.update_budget).to(update_gate.device),
+            )
 
         band_outputs = []
         input_energy = []
@@ -310,15 +338,22 @@ class SSRFullBlock(nn.Module):
         high_band_energy_map = None
         in_high = None
         out_high = None
+        fft_reconstruction = torch.zeros_like(x_float)
         for band in range(self.num_bands):
             mask = masks[band].view(1, 1, H, Wf)
             xk = torch.fft.irfft2(X * mask, s=(H, W), norm="ortho")
-            delta = self.delta_net(xk)
+            fft_reconstruction = fft_reconstruction + xk
+            delta = self.delta_net(xk) if self.block_variant != "s3r_fft_identity" else torch.zeros_like(xk)
             noise_like = xk - F.avg_pool2d(xk, kernel_size=3, stride=1, padding=1)
             retain = retain_gate[:, band].view(B, 1, 1, 1) * xk
             update = update_gate[:, band].view(B, 1, 1, 1) * delta
             suppress = self.noise_strength * suppress_gate[:, band].view(B, 1, 1, 1) * noise_like
-            out_k = retain + update - suppress
+            if self.block_variant == "s3r_fft_identity":
+                out_k = xk
+            elif self.block_variant == "s3r_simple_spectral":
+                out_k = update_gate[:, band].view(B, 1, 1, 1) * xk
+            else:
+                out_k = retain + update - suppress
             band_outputs.append(out_k)
             if band == self.num_bands - 1:
                 in_high = xk.square().mean(dim=(1, 2, 3))
@@ -340,11 +375,24 @@ class SSRFullBlock(nn.Module):
             hf_ratio_penalty = torch.zeros((), device=x.device, dtype=x_float.dtype)
 
         spectral_out = torch.stack(band_outputs, dim=0).sum(dim=0)
-        spectral_out = self.local_refine(spectral_out)
-        gated_update, residual_gate = self._apply_residual_gate(x_float, spectral_out)
-        gated_update = self.geometry_refine(gated_update)
-        gamma = self._gamma_value().to(x_float.dtype)
-        y = (x_float + gamma * gated_update).to(x.dtype)
+        fft_reconstruction_error = (fft_reconstruction - x_float).abs().mean()
+        if self.block_variant == "s3r_fft_identity":
+            gated_update = torch.zeros_like(x_float)
+            residual_gate = None
+            gamma = torch.zeros((), device=x.device, dtype=x_float.dtype)
+            y = spectral_out.to(x.dtype)
+        else:
+            spectral_out = self.local_refine(spectral_out)
+            if self.block_variant == "s3r_simple_spectral":
+                gated_update = self.geometry_refine(spectral_out)
+                residual_gate = None
+            else:
+                gated_update, residual_gate = self._apply_residual_gate(x_float, spectral_out)
+                gated_update = self.geometry_refine(gated_update)
+            gamma = self._gamma_value().to(x_float.dtype)
+            if self.block_variant == "s3r_gamma0":
+                gamma = torch.zeros_like(gamma)
+            y = (x_float + gamma * gated_update).to(x.dtype)
 
         logs: dict[str, Any] = {}
         if return_logs:
@@ -365,6 +413,12 @@ class SSRFullBlock(nn.Module):
                 hf_ratio=hf_ratio,
                 hf_ratio_penalty=hf_ratio_penalty,
                 gamma=gamma,
+                gamma_raw=self._gamma_raw_value().to(x_float.dtype),
+                x=x_float,
+                gated_update=gated_update,
+                y=y.float(),
+                energy=energy,
+                fft_reconstruction_error=fft_reconstruction_error,
                 residual_gate=residual_gate,
             )
         return y, {"gate_reg": gate_reg, "hf_ratio_penalty": hf_ratio_penalty, "logs": logs}
@@ -373,6 +427,13 @@ class SSRFullBlock(nn.Module):
         if self.use_bounded_gamma:
             assert self.gamma_raw is not None
             return self.gamma_max * torch.sigmoid(self.gamma_raw)
+        assert self.gamma is not None
+        return self.gamma
+
+    def _gamma_raw_value(self) -> Tensor:
+        if self.use_bounded_gamma:
+            assert self.gamma_raw is not None
+            return self.gamma_raw
         assert self.gamma is not None
         return self.gamma
 
@@ -406,6 +467,12 @@ class SSRFullBlock(nn.Module):
         hf_ratio: Tensor,
         hf_ratio_penalty: Tensor,
         gamma: Tensor,
+        gamma_raw: Tensor,
+        x: Tensor,
+        gated_update: Tensor,
+        y: Tensor,
+        energy: Tensor,
+        fft_reconstruction_error: Tensor,
         residual_gate: Tensor | None,
     ) -> dict[str, Any]:
         eps = 1e-8
@@ -416,7 +483,16 @@ class SSRFullBlock(nn.Module):
         def per_band_std(t: Tensor) -> list[float]:
             return [float(v) for v in t.detach().std(dim=0, unbiased=False).cpu()]
 
+        feature_norm = x.flatten(1).norm(dim=1)
+        delta_norm = gated_update.flatten(1).norm(dim=1)
+        gamma_delta = gamma * gated_update
+        gamma_delta_norm = gamma_delta.flatten(1).norm(dim=1)
+        residual_ratio = gamma_delta_norm / feature_norm.clamp_min(eps)
+        output_delta = y - x
+        relative_energy = energy / energy.sum(dim=1, keepdim=True).clamp_min(eps)
+
         logs: dict[str, Any] = {
+            "block_variant": self.block_variant,
             "retain_gate_mean": per_band_mean(retain_gate),
             "retain_gate_std": per_band_std(retain_gate),
             "suppress_gate_mean": per_band_mean(suppress_gate),
@@ -425,6 +501,9 @@ class SSRFullBlock(nn.Module):
             "update_gate_std": per_band_std(update_gate),
             "input_energy": per_band_mean(input_energy),
             "output_energy": per_band_mean(output_energy),
+            "energy": per_band_mean(energy),
+            "relative_energy": per_band_mean(relative_energy),
+            "log_energy": per_band_mean(torch.log(energy + eps)),
             "phase_coherence": per_band_mean(phase_coherence),
             "variance": per_band_mean(variance),
             "retain_contribution": per_band_mean(retain_contrib),
@@ -435,6 +514,19 @@ class SSRFullBlock(nn.Module):
             "update_budget_sum": float(update_gate.detach().sum(dim=1).mean().cpu()),
             "gate_reg": float(gate_reg.detach().cpu()),
             "gamma": float(gamma.detach().cpu()),
+            "gamma_raw": float(gamma_raw.detach().cpu()),
+            "gamma_effective": float(gamma.detach().cpu()),
+            "feature_norm": float(feature_norm.detach().mean().cpu()),
+            "delta_norm": float(delta_norm.detach().mean().cpu()),
+            "gamma_delta_norm": float(gamma_delta_norm.detach().mean().cpu()),
+            "residual_ratio": float(residual_ratio.detach().mean().cpu()),
+            "block_input_mean": float(x.detach().mean().cpu()),
+            "block_input_std": float(x.detach().std(unbiased=False).cpu()),
+            "block_output_mean": float(y.detach().mean().cpu()),
+            "block_output_std": float(y.detach().std(unbiased=False).cpu()),
+            "output_delta_mean": float(output_delta.detach().mean().cpu()),
+            "output_delta_std": float(output_delta.detach().std(unbiased=False).cpu()),
+            "fft_reconstruction_error": float(fft_reconstruction_error.detach().cpu()),
         }
         if residual_gate is not None:
             gate_flat = residual_gate.detach().flatten(1)

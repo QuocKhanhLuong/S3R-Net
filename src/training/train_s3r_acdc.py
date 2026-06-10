@@ -57,6 +57,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run_name", default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--variant", default=None)
+    parser.add_argument(
+        "--block_variant",
+        choices=["s3r_full", "s3r_gamma0", "s3r_fft_identity", "s3r_fixed_band", "s3r_no_suppress", "s3r_simple_spectral"],
+        default=None,
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--input_mode", choices=["2d", "25d"], default=None)
     parser.add_argument("--in_channels", type=int, default=None)
@@ -275,6 +280,7 @@ def apply_config_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
     ssr.setdefault("large_kernel_size", 7)
     ssr.setdefault("use_hf_ratio_penalty", True)
     ssr.setdefault("hf_ratio_threshold", 4.0)
+    ssr.setdefault("block_variant", "s3r_full")
     return cfg
 
 
@@ -323,6 +329,11 @@ def apply_variant_and_cli(cfg: dict[str, Any], args: argparse.Namespace) -> dict
         cfg.setdefault("loss_weights", {})["gate_reg"] = args.gate_reg_weight
     if args.return_logs is not None:
         cfg["return_logs"] = bool(args.return_logs)
+    if args.block_variant is not None:
+        cfg.setdefault("ssr", {})["block_variant"] = args.block_variant
+        cfg["variant"] = args.block_variant
+        if args.run_name is None:
+            cfg["run_name"] = f"{cfg['run_name']}_{args.block_variant}"
     if args.use_s3r_state is not None:
         cfg["use_s3r_state"] = bool(args.use_s3r_state)
     if args.no_tqdm:
@@ -645,6 +656,7 @@ def format_pre_epoch_config_table(
     rows: list[tuple[str, str]] = [
         ("Run", str(cfg.get("run_name"))),
         ("Model", f"{cfg.get('model')} variant={cfg.get('variant')}"),
+        ("S3R block variant", str(cfg.get("ssr", {}).get("block_variant", "s3r_full"))),
         ("Device", str(device)),
         ("Batch size", str(cfg.get("actual_batch_size", cfg.get("batch_size")))),
         ("Epochs", str(cfg.get("epochs"))),
@@ -1113,12 +1125,37 @@ def flatten_metrics_for_wandb(prefix: str, metrics: dict[str, Any]) -> dict[str,
     return flat
 
 
-def log_wandb_metrics(run: Any, epoch: int, train_metrics: dict[str, Any], val_metrics: dict[str, Any], extra: dict[str, Any] | None = None) -> None:
+def flatten_s3r_block_rows_for_wandb(rows: list[dict[str, Any]]) -> dict[str, float]:
+    flat: dict[str, float] = {}
+    for row in rows:
+        try:
+            value = float(row.get("value"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value):
+            continue
+        band = row.get("band", "")
+        band_suffix = f"/b{band}" if band != "" else ""
+        key = f"s3r_block/{row.get('split')}/{row.get('block')}/{row.get('metric')}{band_suffix}"
+        flat[key] = value
+    return flat
+
+
+def log_wandb_metrics(
+    run: Any,
+    epoch: int,
+    train_metrics: dict[str, Any],
+    val_metrics: dict[str, Any],
+    extra: dict[str, Any] | None = None,
+    block_rows: list[dict[str, Any]] | None = None,
+) -> None:
     if run is None:
         return
     payload: dict[str, Any] = {"epoch": epoch}
     payload.update(flatten_metrics_for_wandb("train", train_metrics))
     payload.update(flatten_metrics_for_wandb("val", val_metrics))
+    if block_rows:
+        payload.update(flatten_s3r_block_rows_for_wandb(block_rows))
     if extra:
         payload.update({key: value for key, value in extra.items() if isinstance(value, (int, float)) and math.isfinite(float(value))})
     run.log(payload, step=epoch)
@@ -1361,6 +1398,16 @@ def print_detailed_logs(logs: dict[str, Any] | None, prefix: str) -> None:
         "suppress_contribution",
         "high_freq_ratio",
         "high_freq_penalty",
+        "feature_norm",
+        "delta_norm",
+        "gamma_delta_norm",
+        "residual_ratio",
+        "gamma_raw",
+        "gamma_effective",
+        "fft_reconstruction_error",
+        "block_input_mean",
+        "block_output_mean",
+        "output_delta_std",
         "boundary_to_nonboundary_high_ratio",
         "gamma",
         "residual_gate_mean",
@@ -1493,6 +1540,8 @@ def _plot_ssr_metrics(run_dir: Path, rows: list[dict[str, Any]]) -> None:
     plot_metric_set(["high_freq_penalty"], "high_freq_penalty_curves.png", "High-frequency penalty")
     plot_metric_set(["boundary_to_nonboundary_high_ratio"], "boundary_ratio_curves.png", "Boundary/non-boundary high ratio")
     plot_metric_set(["gamma"], "gamma_curves.png", "Effective gamma")
+    plot_metric_set(["residual_ratio", "feature_norm", "delta_norm", "gamma_delta_norm"], "residual_strength_curves.png", "S3R residual strength")
+    plot_metric_set(["fft_reconstruction_error"], "fft_reconstruction_error_curves.png", "FFT reconstruction error")
     plot_metric_set(["residual_gate_mean"], "residual_gate_mean_curves.png", "Residual gate mean")
 
 
@@ -1671,9 +1720,17 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
 
         write_csv(run_dir / "training_log.csv", training_rows)
         write_csv(run_dir / "ssr_logs.csv", ssr_rows, ["epoch", "split", "block", "metric", "band", "value"])
+        write_csv(run_dir / "s3r_block_logs.csv", ssr_rows, ["epoch", "split", "block", "metric", "band", "value"])
 
         print_epoch_report(epoch, train_metrics, val_metrics)
-        log_wandb_metrics(wandb_run, epoch, train_metrics, val_metrics, {"lr": optimizer.param_groups[0]["lr"]})
+        log_wandb_metrics(
+            wandb_run,
+            epoch,
+            train_metrics,
+            val_metrics,
+            {"lr": optimizer.param_groups[0]["lr"]},
+            block_rows=train_ssr_rows + val_ssr_rows,
+        )
 
     torch.save(build_checkpoint_payload(int(cfg["epochs"]), model, optimizer, cfg, reliability_gate), run_dir / "final_model.pt")
     plot_training_curves(run_dir, training_rows, ssr_rows)
@@ -1721,6 +1778,7 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
         "train_cases": len(split_info["train_cases"]),
         "val_cases": len(split_info["val_cases"]),
         "config_flags": {
+            "block_variant": cfg["ssr"].get("block_variant"),
             "residual_gate_type": cfg["ssr"].get("residual_gate_type"),
             "residual_gate_max": cfg["ssr"].get("residual_gate_max"),
             "geometry_refine": cfg["ssr"].get("geometry_refine"),
@@ -1737,6 +1795,7 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
             "startup_config_table.txt",
             "training_log.csv",
             "ssr_logs.csv",
+            "s3r_block_logs.csv",
             "loss_curve.png",
             "val_dice_curve.png",
             "kd_loss_components.png",
@@ -1747,6 +1806,9 @@ def train_once(cfg: dict[str, Any]) -> dict[str, Any]:
             "high_freq_penalty_curves.png",
             "boundary_ratio_curves.png",
             "gamma_curves.png",
+            "residual_strength_curves.png",
+            "fft_reconstruction_error_curves.png",
+            "residual_gate_mean_curves.png",
             "train_predictions.png",
             "val_predictions.png",
             "best_model.pt",
